@@ -1,0 +1,25 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.build_env/
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.agents/
+.DS_Store
+Thumbs.db
+
+# Local reference packs and manual test inputs
+assets/
+reference_assets/
+tests/samples/
+
+# Locally packaged archives
+*.rar
