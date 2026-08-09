@@ -379,6 +379,17 @@ def quantize_image(img, mode="crop", dither=False):
     return result
 
 
+def import_24_bitmap(img):
+    """Map an exact 24x24 bitmap to the game palette without resampling."""
+    if img.size != (N, N):
+        raise ValueError(f"位图尺寸必须为 {N}×{N}，当前为 {img.width}×{img.height}。")
+    src = flatten_alpha(img)
+    return [
+        [nearest_palette_index(src.getpixel((x, y))) for x in range(N)]
+        for y in range(N)
+    ]
+
+
 # ---------------------------- Windows 窗口 ----------------------------
 def find_game_window(keyword):
     windows = []
@@ -1107,6 +1118,7 @@ class App(tk.Tk):
 
         self.source_image = None
         self.crop_box = None
+        self.direct_bitmap_mode = False
         self.source_file_name = ""
         self.matrix = [[3] * N for _ in range(N)]
         self.original_matrix = [row[:] for row in self.matrix]
@@ -1375,19 +1387,33 @@ class App(tk.Tk):
         )
         self.crop_button.pack(side="left", padx=(self._u(6), 0))
 
+        self.bitmap_button = ttk.Button(
+            left,
+            text="▦  导入24×24 PNG位图",
+            style="Secondary.TButton",
+            command=self.open_24_bitmap,
+        )
+        self.bitmap_button.pack(fill="x", pady=(0, 7))
+
         ttk.Label(left, text="缩放方式", style="Muted.TLabel").pack(anchor="w")
-        mode_box = ttk.Combobox(
+        self.mode_box = ttk.Combobox(
             left,
             textvariable=self.fit_mode,
             state="readonly",
             values=("crop", "contain", "stretch"),
             style="Dark.TCombobox",
         )
-        mode_box.pack(fill="x", pady=(2, 3))
-        mode_box.bind("<<ComboboxSelected>>", lambda e: self.reprocess())
+        self.mode_box.pack(fill="x", pady=(2, 3))
+        self.mode_box.bind("<<ComboboxSelected>>", lambda e: self.reprocess())
 
-        ttk.Checkbutton(left, text="Floyd–Steinberg 抖动", variable=self.dither,
-                        command=self.reprocess, style="Card.TCheckbutton").pack(anchor="w")
+        self.dither_check = ttk.Checkbutton(
+            left,
+            text="Floyd–Steinberg 抖动",
+            variable=self.dither,
+            command=self.reprocess,
+            style="Card.TCheckbutton",
+        )
+        self.dither_check.pack(anchor="w")
 
         ttk.Separator(left, style="Dark.TSeparator").pack(fill="x", pady=9)
 
@@ -1716,7 +1742,7 @@ class App(tk.Tk):
         self.matrix = [row[:] for row in self.original_matrix]
         self.edit_history.clear()
         self._render_preview()
-        self._update_matrix_info("已恢复为图片转换后的结果。")
+        self._update_matrix_info("已恢复为当前图片的导入结果。")
 
     def _update_matrix_info(self, status=None):
         used = len({value for row in self.matrix for value in row})
@@ -1751,18 +1777,61 @@ class App(tk.Tk):
             file_name = Path(path).name
             self.source_file_name = file_name
             self.crop_box = None
+            self.direct_bitmap_mode = False
             display_name = file_name if len(file_name) <= 30 else f"{file_name[:15]}…{file_name[-12:]}"
             self.file_var.set(display_name)
             self.status_var.set(f"已载入：{file_name}")
             self.crop_button.configure(state="normal")
+            self.mode_box.configure(state="readonly")
+            self.dither_check.state(["!disabled"])
             self.reprocess()
             self.after(60, self.open_crop_editor)
         except Exception as e:
             messagebox.showerror("读取失败", str(e))
 
+    def open_24_bitmap(self):
+        path = filedialog.askopenfilename(
+            title="导入24×24 PNG位图",
+            filetypes=[("PNG位图", "*.png")],
+        )
+        if not path:
+            return
+
+        try:
+            with Image.open(path) as im:
+                if im.format != "PNG":
+                    raise ValueError("位图直导仅支持 PNG 文件。")
+                bitmap = ImageOps.exif_transpose(im).copy()
+            matrix = import_24_bitmap(bitmap)
+        except Exception as e:
+            messagebox.showerror("位图导入失败", str(e))
+            return
+
+        file_name = Path(path).name
+        self.source_image = bitmap
+        self.source_file_name = file_name
+        self.crop_box = None
+        self.direct_bitmap_mode = True
+        self.matrix = matrix
+        self.original_matrix = [row[:] for row in matrix]
+        self.edit_history.clear()
+        display_name = file_name if len(file_name) <= 24 else f"{file_name[:12]}…{file_name[-9:]}"
+        self.file_var.set(f"{display_name}  ·  位图直导")
+        self.crop_button.configure(state="disabled")
+        self.mode_box.configure(state="disabled")
+        self.dither_check.state(["disabled"])
+        self._render_preview()
+        used = len({value for row in matrix for value in row})
+        self._update_matrix_info(
+            f"位图已逐像素导入：24×24，无尺寸重采样，共使用 {used} 种游戏颜色。"
+        )
+
     def open_crop_editor(self):
         if self.source_image is None:
             messagebox.showinfo("裁切图片", "请先选择一张图片。")
+            return
+        if self.direct_bitmap_mode:
+            messagebox.showinfo("裁切图片", "24×24位图直导模式不进行裁切或尺寸重采样。")
             return
         dialog = CropDialog(self, self.source_image, self.crop_box)
         self.wait_window(dialog)
@@ -1780,6 +1849,16 @@ class App(tk.Tk):
 
     def reprocess(self):
         if self.source_image is None:
+            return
+        if self.direct_bitmap_mode:
+            self.matrix = import_24_bitmap(self.source_image)
+            self.original_matrix = [row[:] for row in self.matrix]
+            self.edit_history.clear()
+            self._render_preview()
+            used = len({value for row in self.matrix for value in row})
+            self._update_matrix_info(
+                f"位图已逐像素导入：24×24，无尺寸重采样，共使用 {used} 种游戏颜色。"
+            )
             return
         source = self.source_image
         if self.crop_box is not None:
