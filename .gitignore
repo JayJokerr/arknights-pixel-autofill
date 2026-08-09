@@ -8,6 +8,7 @@ venv/
 # PyInstaller output
 build/
 dist/
+.demo-output/
 
 # IDE and OS metadata
 .idea/

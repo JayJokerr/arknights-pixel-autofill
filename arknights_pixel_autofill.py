@@ -80,6 +80,32 @@ except Exception:
     pass
 
 
+def is_running_as_admin():
+    """Return whether the current Windows process has an elevated token."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def require_admin_before_startup():
+    """Show a native warning and stop before Tk is created when not elevated."""
+    if is_running_as_admin():
+        return True
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "本工具需要管理员权限才能向游戏窗口稳定发送鼠标输入。\n\n"
+            "请关闭本提示后，右键程序并选择“以管理员身份运行”。",
+            "需要管理员权限",
+            0x00000000 | 0x00000030 | 0x00040000 | 0x00010000,
+            # MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
+        )
+    except Exception:
+        pass
+    return False
+
+
 # ---------------------------- 游戏鼠标输入 ----------------------------
 # PyAutoGUI 在 Windows 上使用旧式 mouse_event。部分游戏在获得焦点后会切换到
 # DirectInput/Raw Input 路径，从而忽略这类事件。这里直接使用 SendInput；它产生的
@@ -306,14 +332,48 @@ def color_distance(c1, c2):
     return (2.0 + rmean / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rmean) / 256.0) * db * db
 
 
-def nearest_palette_index(rgb):
+def _srgb_to_linear(value):
+    value = max(0.0, min(255.0, float(value))) / 255.0
+    return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+
+def rgb_to_oklab(rgb):
+    """Convert an sRGB triplet to OKLab for perceptual color comparison."""
+    r, g, b = (_srgb_to_linear(value) for value in rgb)
+    ll = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    mm = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    ss = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l = max(0.0, ll) ** (1.0 / 3.0)
+    m = max(0.0, mm) ** (1.0 / 3.0)
+    s = max(0.0, ss) ** (1.0 / 3.0)
+    return (
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    )
+
+
+OKLAB_PALETTE = [rgb_to_oklab(color) for color in PALETTE]
+
+
+def nearest_palette_index(rgb, perceptual=False, candidates=None):
+    choices = range(len(PALETTE)) if candidates is None else candidates
     best_i = 0
     best_d = float("inf")
-    for i, c in enumerate(PALETTE):
-        d = color_distance(rgb, c)
-        if d < best_d:
-            best_d = d
-            best_i = i
+    if perceptual:
+        value = rgb_to_oklab(rgb)
+        for i in choices:
+            target = OKLAB_PALETTE[i]
+            d = sum((value[channel] - target[channel]) ** 2 for channel in range(3))
+            if d < best_d:
+                best_d = d
+                best_i = i
+    else:
+        for i in choices:
+            d = color_distance(rgb, PALETTE[i])
+            if d < best_d:
+                best_d = d
+                best_i = i
     return best_i
 
 
@@ -324,16 +384,25 @@ def flatten_alpha(img):
     return bg.convert("RGB")
 
 
-def resize_to_24(img, mode="crop"):
+RESAMPLE_METHODS = {
+    "Lanczos（原版）": Image.Resampling.LANCZOS,
+    "BOX（减少混色）": Image.Resampling.BOX,
+    "Bicubic（柔和）": Image.Resampling.BICUBIC,
+    "Nearest（像素画）": Image.Resampling.NEAREST,
+}
+
+
+def resize_to_24(img, mode="crop", resample="Lanczos（原版）"):
     img = flatten_alpha(img)
+    method = RESAMPLE_METHODS.get(resample, Image.Resampling.LANCZOS)
 
     if mode == "stretch":
-        return img.resize((N, N), Image.Resampling.LANCZOS)
+        return img.resize((N, N), method)
 
     if mode == "contain":
         out = Image.new("RGB", (N, N), (255, 255, 255))
         tmp = img.copy()
-        tmp.thumbnail((N, N), Image.Resampling.LANCZOS)
+        tmp.thumbnail((N, N), method)
         x = (N - tmp.width) // 2
         y = (N - tmp.height) // 2
         out.paste(tmp, (x, y))
@@ -343,15 +412,27 @@ def resize_to_24(img, mode="crop"):
     return ImageOps.fit(
         img,
         (N, N),
-        method=Image.Resampling.LANCZOS,
+        method=method,
         centering=(0.5, 0.5),
     )
 
 
-def quantize_image(img, mode="crop", dither=False):
-    src = resize_to_24(img, mode)
+def quantize_image(
+    img,
+    mode="crop",
+    dither=False,
+    perceptual=False,
+    reduce_transitions=False,
+    resample="Lanczos（原版）",
+):
+    src = resize_to_24(img, mode, resample=resample)
     work = [[[float(v) for v in src.getpixel((x, y))] for x in range(N)] for y in range(N)]
     result = [[3 for _ in range(N)] for _ in range(N)]
+
+    # Error diffusion deliberately creates intermediate color patterns, so the
+    # transition-reduction mode always uses clean, non-dithered color blocks.
+    if reduce_transitions:
+        dither = False
 
     def add_error(x, y, er, eg, eb, factor):
         if 0 <= x < N and 0 <= y < N:
@@ -363,7 +444,7 @@ def quantize_image(img, mode="crop", dither=False):
     for y in range(N):
         for x in range(N):
             old = tuple(int(round(v)) for v in work[y][x])
-            idx = nearest_palette_index(old)
+            idx = nearest_palette_index(old, perceptual=perceptual)
             result[y][x] = idx
 
             if dither:
@@ -376,16 +457,32 @@ def quantize_image(img, mode="crop", dither=False):
                 add_error(x,     y + 1, er, eg, eb, 5 / 16)
                 add_error(x + 1, y + 1, er, eg, eb, 1 / 16)
 
+    if reduce_transitions:
+        # Keep the 16 colors that contribute most to this picture, then remap
+        # the low-frequency transition shades to their closest retained color.
+        counts = [0] * len(PALETTE)
+        for row in result:
+            for index in row:
+                counts[index] += 1
+        retained = sorted(range(len(PALETTE)), key=lambda i: counts[i], reverse=True)[:16]
+        result = [
+            [
+                nearest_palette_index(src.getpixel((x, y)), perceptual=perceptual, candidates=retained)
+                for x in range(N)
+            ]
+            for y in range(N)
+        ]
+
     return result
 
 
-def import_24_bitmap(img):
+def import_24_bitmap(img, perceptual=False):
     """Map an exact 24x24 bitmap to the game palette without resampling."""
     if img.size != (N, N):
         raise ValueError(f"位图尺寸必须为 {N}×{N}，当前为 {img.width}×{img.height}。")
     src = flatten_alpha(img)
     return [
-        [nearest_palette_index(src.getpixel((x, y))) for x in range(N)]
+        [nearest_palette_index(src.getpixel((x, y)), perceptual=perceptual) for x in range(N)]
         for y in range(N)
     ]
 
@@ -1072,8 +1169,11 @@ class CropDialog(tk.Toplevel):
 # ---------------------------- GUI ----------------------------
 class App(tk.Tk):
     BASE_PREVIEW_SIZE = 408
+    MIN_PREVIEW_SIZE = 240
     BASE_WINDOW_W = 1180
     BASE_WINDOW_H = 760
+    MIN_WINDOW_W = 920
+    MIN_WINDOW_H = 660
     BG = "#17384d"
     BODY_BG = "#285f7d"
     HERO_BG = "#2f7fa7"
@@ -1105,7 +1205,7 @@ class App(tk.Tk):
         self.overrideredirect(False)
         self.geometry(f"{self.WINDOW_W}x{self.WINDOW_H}")
         self.resizable(True, True)
-        self.minsize(self.WINDOW_W, self.WINDOW_H)
+        self.minsize(self._u(self.MIN_WINDOW_W), self._u(self.MIN_WINDOW_H))
         self.configure(bg=self.BG)
 
         icon = tk.PhotoImage(width=32, height=32)
@@ -1131,9 +1231,12 @@ class App(tk.Tk):
 
         self.window_keyword = tk.StringVar(value="明日方舟")
         self.fit_mode = tk.StringVar(value="crop")
+        self.resample_mode = tk.StringVar(value="Lanczos（原版）")
+        self.color_match_mode = tk.StringVar(value="经典RGB（原版）")
         self.dither = tk.BooleanVar(value=False)
+        self.reduce_transitions = tk.BooleanVar(value=False)
         self.click_delay = tk.DoubleVar(value=0.060)
-        self.skip_white = tk.BooleanVar(value=False)
+        self.skip_white = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="请选择一张图片。")
         self.file_var = tk.StringVar(value="尚未选择图片")
         self.palette_info_var = tk.StringVar(value="40 色游戏调色板")
@@ -1367,9 +1470,37 @@ class App(tk.Tk):
         body = tk.Frame(root, bg=self.BODY_BG, padx=self._u(14), pady=self._u(10))
         body.pack(fill="both", expand=True)
 
-        left = ttk.Frame(body, style="Card.TFrame", padding=self._u(13), width=self._u(270))
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
+        left_shell = ttk.Frame(body, style="Card.TFrame", width=self._u(270))
+        left_shell.pack(side="left", fill="y")
+        left_shell.pack_propagate(False)
+        left_canvas = tk.Canvas(
+            left_shell,
+            bg=self.CARD,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        left_scrollbar = ttk.Scrollbar(left_shell, orient="vertical", command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+        left_scrollbar.pack(side="right", fill="y")
+        left_canvas.pack(side="left", fill="both", expand=True)
+        left = ttk.Frame(left_canvas, style="Card.TFrame", padding=self._u(13))
+        left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
+        left.bind(
+            "<Configure>",
+            lambda _event: left_canvas.configure(scrollregion=left_canvas.bbox("all")),
+        )
+        left_canvas.bind(
+            "<Configure>",
+            lambda event: left_canvas.itemconfigure(left_window, width=event.width),
+        )
+
+        def scroll_left_panel(event):
+            steps = -1 if event.delta > 0 else 1
+            left_canvas.yview_scroll(steps, "units")
+
+        left_shell.bind("<Enter>", lambda _event: self.bind_all("<MouseWheel>", scroll_left_panel))
+        left_shell.bind("<Leave>", lambda _event: self.unbind_all("<MouseWheel>"))
+        self.left_scroll_canvas = left_canvas
 
         ttk.Label(left, text="01  图片处理", style="Section.TLabel").pack(anchor="w")
         ttk.Label(left, textvariable=self.file_var, style="Muted.TLabel").pack(
@@ -1406,6 +1537,28 @@ class App(tk.Tk):
         self.mode_box.pack(fill="x", pady=(2, 3))
         self.mode_box.bind("<<ComboboxSelected>>", lambda e: self.reprocess())
 
+        ttk.Label(left, text="缩放取样算法", style="Muted.TLabel").pack(anchor="w")
+        self.resample_box = ttk.Combobox(
+            left,
+            textvariable=self.resample_mode,
+            state="readonly",
+            values=tuple(RESAMPLE_METHODS),
+            style="Dark.TCombobox",
+        )
+        self.resample_box.pack(fill="x", pady=(2, 3))
+        self.resample_box.bind("<<ComboboxSelected>>", lambda _event: self.reprocess())
+
+        ttk.Label(left, text="颜色匹配算法", style="Muted.TLabel").pack(anchor="w")
+        self.match_box = ttk.Combobox(
+            left,
+            textvariable=self.color_match_mode,
+            state="readonly",
+            values=("经典RGB（原版）", "OKLab（感知）"),
+            style="Dark.TCombobox",
+        )
+        self.match_box.pack(fill="x", pady=(2, 3))
+        self.match_box.bind("<<ComboboxSelected>>", lambda _event: self.reprocess())
+
         self.dither_check = ttk.Checkbutton(
             left,
             text="Floyd–Steinberg 抖动",
@@ -1414,6 +1567,15 @@ class App(tk.Tk):
             style="Card.TCheckbutton",
         )
         self.dither_check.pack(anchor="w")
+
+        self.transition_check = ttk.Checkbutton(
+            left,
+            text="减少过渡色（最多16色）",
+            variable=self.reduce_transitions,
+            command=self._toggle_reduce_transitions,
+            style="Card.TCheckbutton",
+        )
+        self.transition_check.pack(anchor="w")
 
         ttk.Separator(left, style="Dark.TSeparator").pack(fill="x", pady=9)
 
@@ -1594,7 +1756,7 @@ class App(tk.Tk):
         available_w = center_w - self._u(34)
         available_h = center_h - reserved_h
         target = min(available_w, available_h)
-        target = max(self._u(self.BASE_PREVIEW_SIZE), target)
+        target = max(self._u(self.MIN_PREVIEW_SIZE), target)
         # An exact multiple of 24 keeps cell boundaries and pointer hit-testing
         # identical at every window size.
         target = max(N * 8, (int(target) // N) * N)
@@ -1756,6 +1918,21 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _sync_algorithm_controls(self):
+        if self.direct_bitmap_mode or self.reduce_transitions.get():
+            self.dither_check.state(["disabled"])
+        else:
+            self.dither_check.state(["!disabled"])
+
+    def _perceptual_enabled(self):
+        return self.color_match_mode.get().startswith("OKLab")
+
+    def _toggle_reduce_transitions(self):
+        if self.reduce_transitions.get():
+            self.dither.set(False)
+        self._sync_algorithm_controls()
+        self.reprocess()
+
     def _on_close(self):
         self.painter.stop()
         self.destroy()
@@ -1783,7 +1960,11 @@ class App(tk.Tk):
             self.status_var.set(f"已载入：{file_name}")
             self.crop_button.configure(state="normal")
             self.mode_box.configure(state="readonly")
+            self.resample_box.configure(state="readonly")
+            self.match_box.configure(state="readonly")
             self.dither_check.state(["!disabled"])
+            self.transition_check.state(["!disabled"])
+            self._sync_algorithm_controls()
             self.reprocess()
             self.after(60, self.open_crop_editor)
         except Exception as e:
@@ -1802,7 +1983,7 @@ class App(tk.Tk):
                 if im.format != "PNG":
                     raise ValueError("位图直导仅支持 PNG 文件。")
                 bitmap = ImageOps.exif_transpose(im).copy()
-            matrix = import_24_bitmap(bitmap)
+            matrix = import_24_bitmap(bitmap, perceptual=self._perceptual_enabled())
         except Exception as e:
             messagebox.showerror("位图导入失败", str(e))
             return
@@ -1819,7 +2000,10 @@ class App(tk.Tk):
         self.file_var.set(f"{display_name}  ·  位图直导")
         self.crop_button.configure(state="disabled")
         self.mode_box.configure(state="disabled")
+        self.resample_box.configure(state="disabled")
+        self.match_box.configure(state="readonly")
         self.dither_check.state(["disabled"])
+        self.transition_check.state(["disabled"])
         self._render_preview()
         used = len({value for row in matrix for value in row})
         self._update_matrix_info(
@@ -1851,7 +2035,10 @@ class App(tk.Tk):
         if self.source_image is None:
             return
         if self.direct_bitmap_mode:
-            self.matrix = import_24_bitmap(self.source_image)
+            self.matrix = import_24_bitmap(
+                self.source_image,
+                perceptual=self._perceptual_enabled(),
+            )
             self.original_matrix = [row[:] for row in self.matrix]
             self.edit_history.clear()
             self._render_preview()
@@ -1866,14 +2053,23 @@ class App(tk.Tk):
         self.matrix = quantize_image(
             source,
             mode=self.fit_mode.get(),
+            resample=self.resample_mode.get(),
             dither=self.dither.get(),
+            perceptual=self._perceptual_enabled(),
+            reduce_transitions=self.reduce_transitions.get(),
         )
         self.original_matrix = [row[:] for row in self.matrix]
         self.edit_history.clear()
         self._render_preview()
 
         used = len({v for row in self.matrix for v in row})
-        self._update_matrix_info(f"转换完成：24×24，共使用 {used} 种游戏颜色；可在预览中继续修改。")
+        match_name = "OKLab" if self._perceptual_enabled() else "经典RGB"
+        resample_name = self.resample_mode.get().split("（", 1)[0]
+        transition_name = "，已减少过渡色" if self.reduce_transitions.get() else ""
+        self._update_matrix_info(
+            f"转换完成：{resample_name}＋{match_name}{transition_name}，"
+            f"共使用 {used} 种游戏颜色；可继续修改。"
+        )
 
     def _render_preview(self):
         size = self.PREVIEW_SIZE
@@ -1978,5 +2174,7 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    if not require_admin_before_startup():
+        raise SystemExit(1)
     app = App()
     app.mainloop()
