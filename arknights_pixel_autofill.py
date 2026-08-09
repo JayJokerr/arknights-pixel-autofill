@@ -24,10 +24,20 @@ import os
 import time
 import threading
 import ctypes
+import json
+import re
+import urllib.request
+import webbrowser
 from ctypes import wintypes
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
+
+
+APP_VERSION = "1.2.0"
+GITHUB_REPOSITORY = "JayJokerr/arknights-pixel-autofill"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 
 
 def resource_path(*parts):
@@ -1170,6 +1180,7 @@ class CropDialog(tk.Toplevel):
 class App(tk.Tk):
     BASE_PREVIEW_SIZE = 408
     MIN_PREVIEW_SIZE = 240
+    COLOR_GUIDE_MARGIN = 28
     BASE_WINDOW_W = 1180
     BASE_WINDOW_H = 760
     MIN_WINDOW_W = 920
@@ -1237,6 +1248,7 @@ class App(tk.Tk):
         self.reduce_transitions = tk.BooleanVar(value=False)
         self.click_delay = tk.DoubleVar(value=0.060)
         self.skip_white = tk.BooleanVar(value=True)
+        self.show_color_numbers = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="请选择一张图片。")
         self.file_var = tk.StringVar(value="尚未选择图片")
         self.palette_info_var = tk.StringVar(value="40 色游戏调色板")
@@ -1247,6 +1259,8 @@ class App(tk.Tk):
         self._drag_offset = (0, 0)
         self._native_hwnd = None
         self._responsive_after = None
+        self._compact_layout = None
+        self._latest_release = None
 
         self._build_ui()
         self._render_preview()
@@ -1258,6 +1272,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Map>", self._restore_borderless)
         self.bind("<Configure>", self._on_window_configure)
+        self.after(1400, self._start_update_check)
 
     def _u(self, value):
         return max(1, round(float(value) * self.ui_scale))
@@ -1350,6 +1365,7 @@ class App(tk.Tk):
 
     def _build_ui(self):
         style = ttk.Style(self)
+        self.ui_style = style
         style.theme_use("clam")
         style.configure(".", font=("Microsoft YaHei UI", 10))
         style.configure("App.TFrame", background=self.BG)
@@ -1384,6 +1400,10 @@ class App(tk.Tk):
         style.configure("Danger.TButton", background="#40252c", foreground="#ff9ca1",
                         borderwidth=0, padding=(12, 9))
         style.map("Danger.TButton", background=[("active", "#563038"), ("pressed", "#321c22")])
+        style.configure("Update.TButton", background=self.ACCENT, foreground="#102431",
+                        borderwidth=0, padding=(10, 6),
+                        font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("Update.TButton", background=[("active", "#a8f2ff"), ("pressed", "#35bad6")])
         style.configure("Card.TCheckbutton", background=self.CARD, foreground=self.TEXT,
                         indicatorcolor=self.CARD_ALT, padding=(0, 4))
         style.map("Card.TCheckbutton", background=[("active", self.CARD)],
@@ -1438,6 +1458,7 @@ class App(tk.Tk):
 
         # 旅行主题 Hero，使用 Angelina 素材
         hero = tk.Canvas(root, height=self._u(90), bg=self.HERO_BG, highlightthickness=0)
+        self.hero_canvas = hero
         hero.pack(fill="x")
         hero.create_rectangle(0, self._u(64), self.WINDOW_W, self._u(90), fill="#286d91", outline="")
         hero.create_text(self._u(24), self._u(18), text="ARKNIGHTS  /  PIXEL STUDIO", anchor="w",
@@ -1457,15 +1478,24 @@ class App(tk.Tk):
 
         # 底部固定免责声明，避免窗口缩放时被主体区域挤出
         legal = tk.Frame(root, bg="#102431", height=self._u(48))
+        self.legal_bar = legal
         legal.pack(side="bottom", fill="x")
         legal.pack_propagate(False)
-        tk.Label(
+        self.legal_label = tk.Label(
             legal,
             text=("免责声明｜本工具为用户上传并于B站发布，请自行甄别、谨慎使用。严禁制作、上传或传播任何与国家法律法规及政策相抵触的内容；\n"
                   "使用者自行承担使用风险及后果。  ·  建议游戏客户区 1280×720  ·  F8 紧急停止"),
             bg="#102431", fg="#b8d1dc", justify="left",
             font=("Microsoft YaHei UI", 8), padx=self._u(16),
-        ).pack(side="left", fill="y")
+        )
+        self.legal_label.pack(side="left", fill="both", expand=True)
+        self.update_button = ttk.Button(
+            legal,
+            text="发现新版本",
+            style="Update.TButton",
+            command=self._offer_release_download,
+            cursor="hand2",
+        )
 
         body = tk.Frame(root, bg=self.BODY_BG, padx=self._u(14), pady=self._u(10))
         body.pack(fill="both", expand=True)
@@ -1479,10 +1509,10 @@ class App(tk.Tk):
             highlightthickness=0,
             borderwidth=0,
         )
-        left_scrollbar = ttk.Scrollbar(left_shell, orient="vertical", command=left_canvas.yview)
-        left_canvas.configure(yscrollcommand=left_scrollbar.set)
-        left_scrollbar.pack(side="right", fill="y")
-        left_canvas.pack(side="left", fill="both", expand=True)
+        # The sidebar follows the window density instead of permanently showing
+        # a scrollbar.  Mouse-wheel scrolling remains as a last-resort fallback
+        # for unusually large accessibility fonts.
+        left_canvas.pack(fill="both", expand=True)
         left = ttk.Frame(left_canvas, style="Card.TFrame", padding=self._u(13))
         left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
         left.bind(
@@ -1501,6 +1531,7 @@ class App(tk.Tk):
         left_shell.bind("<Enter>", lambda _event: self.bind_all("<MouseWheel>", scroll_left_panel))
         left_shell.bind("<Leave>", lambda _event: self.unbind_all("<MouseWheel>"))
         self.left_scroll_canvas = left_canvas
+        self.left_content = left
 
         ttk.Label(left, text="01  图片处理", style="Section.TLabel").pack(anchor="w")
         ttk.Label(left, textvariable=self.file_var, style="Muted.TLabel").pack(
@@ -1607,8 +1638,12 @@ class App(tk.Tk):
         ttk.Button(left, text="■  停止", style="Danger.TButton",
                    command=self.stop_paint).pack(fill="x")
 
-        ttk.Label(left, text="建议 1280×720  ·  紧急停止 F8", style="Muted.TLabel").pack(
-            anchor="center", pady=(7, 0))
+        self.sidebar_footer_hint = ttk.Label(
+            left,
+            text="建议 1280×720  ·  紧急停止 F8",
+            style="Muted.TLabel",
+        )
+        self.sidebar_footer_hint.pack(anchor="center", pady=(7, 0))
 
         palette_panel = ttk.Frame(body, style="Card.TFrame", padding=self._u(12), width=self._u(214))
         palette_panel.pack(side="right", fill="y")
@@ -1636,11 +1671,23 @@ class App(tk.Tk):
         self.preview_head = preview_head
         preview_head.pack(fill="x", pady=(0, 7))
         ttk.Label(preview_head, text="实时预览", style="Section.TLabel").pack(side="left")
+        ttk.Checkbutton(
+            preview_head,
+            text="显示色号",
+            variable=self.show_color_numbers,
+            command=self._toggle_color_numbers,
+            style="Card.TCheckbutton",
+        ).pack(side="left", padx=(self._u(10), 0))
         ttk.Button(preview_head, text="恢复转换结果", style="Compact.TButton",
                    command=self._reset_manual_edits).pack(side="right")
         ttk.Button(preview_head, text="撤销", style="Compact.TButton",
                    command=self._undo_edit).pack(side="right", padx=(0, 6))
-        ttk.Label(preview_head, textvariable=self.palette_info_var, style="Badge.TLabel").pack(side="right")
+        self.palette_info_label = ttk.Label(
+            preview_head,
+            textvariable=self.palette_info_var,
+            style="Badge.TLabel",
+        )
+        self.palette_info_label.pack(side="right")
 
         canvas_shell = tk.Frame(center, bg="#b8e8f5", padx=1, pady=1)
         canvas_shell.pack(anchor="center", expand=True)
@@ -1748,6 +1795,8 @@ class App(tk.Tk):
         if center_w < 100 or center_h < 100:
             return
 
+        self._apply_layout_density(self.winfo_height() < self._u(720))
+
         reserved_h = (
             self.preview_head.winfo_height()
             + self.preview_info.winfo_height()
@@ -1755,7 +1804,8 @@ class App(tk.Tk):
         )
         available_w = center_w - self._u(34)
         available_h = center_h - reserved_h
-        target = min(available_w, available_h)
+        guide_margin = self._color_guide_margin()
+        target = min(available_w, available_h) - guide_margin
         target = max(self._u(self.MIN_PREVIEW_SIZE), target)
         # An exact multiple of 24 keeps cell boundaries and pointer hit-testing
         # identical at every window size.
@@ -1765,6 +1815,59 @@ class App(tk.Tk):
             self.canvas.configure(width=target, height=target)
             self._render_preview()
         self._draw_palette()
+
+    def _apply_layout_density(self, compact):
+        """Keep every column visually in sync when the window becomes short."""
+        compact = bool(compact)
+        if compact == self._compact_layout:
+            return
+        self._compact_layout = compact
+        style = self.ui_style
+        if compact:
+            style.configure(".", font=("Microsoft YaHei UI", 9))
+            style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
+            style.configure("Muted.TLabel", font=("Microsoft YaHei UI", 8))
+            style.configure("Secondary.TButton", padding=(8, 5))
+            style.configure("Primary.TButton", padding=(10, 6))
+            style.configure("Danger.TButton", padding=(8, 5))
+            style.configure("Compact.TButton", padding=(6, 4), font=("Microsoft YaHei UI", 8))
+            style.configure("Card.TCheckbutton", padding=(0, 1))
+            style.configure("Dark.TEntry", padding=4)
+            style.configure("Dark.TCombobox", padding=2)
+            style.configure("Badge.TLabel", padding=(7, 3), font=("Segoe UI", 8, "bold"))
+            self.hero_canvas.configure(height=self._u(70))
+            self.legal_bar.configure(height=self._u(38))
+            self.legal_label.configure(
+                text="免责声明｜用户上传并于B站发布，请自行甄别、谨慎使用；严禁传播违法违规内容。  ·  1280×720  ·  F8停止",
+                font=("Microsoft YaHei UI", 8),
+            )
+            self.sidebar_footer_hint.pack_forget()
+            self.palette_info_label.pack_forget()
+        else:
+            style.configure(".", font=("Microsoft YaHei UI", 10))
+            style.configure("Section.TLabel", font=("Microsoft YaHei UI", 11, "bold"))
+            style.configure("Muted.TLabel", font=("Microsoft YaHei UI", 9))
+            style.configure("Secondary.TButton", padding=(12, 9))
+            style.configure("Primary.TButton", padding=(14, 11))
+            style.configure("Danger.TButton", padding=(12, 9))
+            style.configure("Compact.TButton", padding=(8, 6), font=("Microsoft YaHei UI", 9))
+            style.configure("Card.TCheckbutton", padding=(0, 4))
+            style.configure("Dark.TEntry", padding=7)
+            style.configure("Dark.TCombobox", padding=5)
+            style.configure("Badge.TLabel", padding=(10, 5), font=("Segoe UI", 9, "bold"))
+            self.hero_canvas.configure(height=self._u(90))
+            self.legal_bar.configure(height=self._u(48))
+            self.legal_label.configure(
+                text=("免责声明｜本工具为用户上传并于B站发布，请自行甄别、谨慎使用。严禁制作、上传或传播任何与国家法律法规及政策相抵触的内容；\n"
+                      "使用者自行承担使用风险及后果。  ·  建议游戏客户区 1280×720  ·  F8 紧急停止"),
+                font=("Microsoft YaHei UI", 8),
+            )
+            if not self.sidebar_footer_hint.winfo_manager():
+                self.sidebar_footer_hint.pack(anchor="center", pady=(7, 0))
+            if not self.palette_info_label.winfo_manager():
+                self.palette_info_label.pack(side="right")
+        self.update_idletasks()
+        self.left_scroll_canvas.yview_moveto(0.0)
 
     def _minimize_window(self):
         self.update_idletasks()
@@ -1776,6 +1879,20 @@ class App(tk.Tk):
             self.after(10, self._configure_taskbar_window)
 
     # ---------------------------- 手动像素编辑 ----------------------------
+    @staticmethod
+    def _contrast_text_color(color):
+        r, g, b = color
+        luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return "#17212a" if luminance >= 150 else "#f7fbfc"
+
+    def _color_guide_margin(self):
+        return self._u(self.COLOR_GUIDE_MARGIN) if self.show_color_numbers.get() else 0
+
+    def _toggle_color_numbers(self):
+        self._apply_responsive_layout()
+        self._render_preview()
+        self._draw_palette()
+
     def _draw_palette(self):
         if not hasattr(self, "palette_canvas"):
             return
@@ -1816,6 +1933,14 @@ class App(tk.Tk):
                 inset = self._u(4)
                 canvas.create_rectangle(x0 + inset, y0 + inset, x1 - inset, y1 - inset,
                                         outline=self.ACCENT, width=self._u(2))
+            if self.show_color_numbers.get():
+                canvas.create_text(
+                    (x0 + x1) / 2,
+                    (y0 + y1) / 2,
+                    text=str(index + 1),
+                    fill=self._contrast_text_color(color),
+                    font=("Segoe UI", max(6, min(9, swatch // 4)), "bold"),
+                )
             self.palette_hitboxes.append((x0, y0, x1, y1))
 
     def _palette_click(self, event):
@@ -1833,9 +1958,12 @@ class App(tk.Tk):
         self._draw_palette()
 
     def _event_cell(self, event):
+        margin = self._color_guide_margin()
         cell = self.PREVIEW_SIZE / N
-        col = int(event.x / cell)
-        row = int(event.y / cell)
+        if event.x < margin or event.y < margin:
+            return None
+        col = int((event.x - margin) / cell)
+        row = int((event.y - margin) / cell)
         if 0 <= col < N and 0 <= row < N:
             return col, row
         return None
@@ -1848,6 +1976,12 @@ class App(tk.Tk):
             self.cell_items[row][col],
             fill=f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}",
         )
+        if self.show_color_numbers.get() and getattr(self, "cell_number_items", None):
+            self.canvas.itemconfigure(
+                self.cell_number_items[row][col],
+                text=str(self.matrix[row][col] + 1),
+                fill=self._contrast_text_color(color),
+            )
 
     def _apply_preview_color(self, event):
         if self.source_image is None:
@@ -2073,19 +2207,23 @@ class App(tk.Tk):
 
     def _render_preview(self):
         size = self.PREVIEW_SIZE
+        margin = self._color_guide_margin()
+        total_size = size + margin
         cell = size / N
+        self.canvas.configure(width=total_size, height=total_size)
         self.canvas.delete("all")
         self.cell_items = [[None for _ in range(N)] for _ in range(N)]
+        self.cell_number_items = [[None for _ in range(N)] for _ in range(N)]
 
         for y in range(N):
             for x in range(N):
                 idx = self.matrix[y][x]
                 c = PALETTE[idx]
                 color = f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}"
-                x0 = x * cell
-                y0 = y * cell
-                x1 = (x + 1) * cell
-                y1 = (y + 1) * cell
+                x0 = margin + x * cell
+                y0 = margin + y * cell
+                x1 = margin + (x + 1) * cell
+                y1 = margin + (y + 1) * cell
                 item_id = self.canvas.create_rectangle(
                     x0, y0, x1, y1,
                     fill=color,
@@ -2093,6 +2231,113 @@ class App(tk.Tk):
                     width=1,
                 )
                 self.cell_items[y][x] = item_id
+                if self.show_color_numbers.get():
+                    self.cell_number_items[y][x] = self.canvas.create_text(
+                        margin + (x + 0.5) * cell,
+                        margin + (y + 0.5) * cell,
+                        text=str(idx + 1),
+                        fill=self._contrast_text_color(c),
+                        font=("Segoe UI", max(5, min(9, int(cell * 0.43))), "bold"),
+                    )
+
+        if self.show_color_numbers.get():
+            guide_font = ("Segoe UI", max(5, min(9, int(cell * 0.42))))
+            guide_bold_font = ("Segoe UI", max(6, min(10, int(cell * 0.46))), "bold")
+            for index in range(N):
+                number = index + 1
+                emphasized = number % 12 == 0
+                text_color = self.ORANGE if emphasized else self.MUTED
+                text_font = guide_bold_font if emphasized else guide_font
+                center = margin + (index + 0.5) * cell
+                self.canvas.create_text(
+                    center,
+                    margin / 2,
+                    text=str(number),
+                    fill=text_color,
+                    font=text_font,
+                )
+                self.canvas.create_text(
+                    margin / 2,
+                    center,
+                    text=str(number),
+                    fill=text_color,
+                    font=text_font,
+                )
+
+            strong_width = max(2, self._u(2))
+            for multiple in (0, 12, 24):
+                position = margin + multiple * cell
+                self.canvas.create_line(
+                    margin,
+                    position,
+                    margin + size,
+                    position,
+                    fill=self.ACCENT_DARK if multiple == 12 else self.BORDER,
+                    width=strong_width,
+                )
+                self.canvas.create_line(
+                    position,
+                    margin,
+                    position,
+                    margin + size,
+                    fill=self.ACCENT_DARK if multiple == 12 else self.BORDER,
+                    width=strong_width,
+                )
+
+    # ---------------------------- 在线更新 ----------------------------
+    @staticmethod
+    def _version_tuple(value):
+        numbers = re.findall(r"\d+", str(value))
+        return tuple(int(part) for part in numbers[:4]) or (0,)
+
+    def _start_update_check(self):
+        threading.Thread(target=self._check_latest_release, daemon=True).start()
+
+    def _check_latest_release(self):
+        try:
+            request = urllib.request.Request(
+                GITHUB_LATEST_RELEASE_API,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"Arknights-Pixel-Autofill/{APP_VERSION}",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=7) as response:
+                release = json.loads(response.read().decode("utf-8"))
+            tag = str(release.get("tag_name", "")).strip()
+            if self._version_tuple(tag) <= self._version_tuple(APP_VERSION):
+                return
+            assets = release.get("assets") or []
+            exe_asset = next(
+                (asset for asset in assets if str(asset.get("name", "")).lower().endswith(".exe")),
+                None,
+            )
+            self._latest_release = {
+                "tag": tag,
+                "page_url": release.get("html_url") or GITHUB_RELEASES_URL,
+                "download_url": (exe_asset or {}).get("browser_download_url"),
+            }
+            self.after(0, self._show_update_button)
+        except Exception:
+            # Update checks must never delay or block the local drawing tool.
+            return
+
+    def _show_update_button(self):
+        if not self.winfo_exists() or not self._latest_release:
+            return
+        self.update_button.configure(text=f"更新 {self._latest_release['tag']}")
+        self.update_button.pack(side="right", padx=(6, self._u(10)), pady=self._u(5))
+
+    def _offer_release_download(self):
+        release = self._latest_release
+        if not release:
+            return
+        if not messagebox.askyesno(
+            "发现新版本",
+            f"当前版本：v{APP_VERSION}\n最新版本：{release['tag']}\n\n是否打开浏览器下载最新版？",
+        ):
+            return
+        webbrowser.open(release.get("download_url") or release["page_url"])
 
     def check_window(self):
         keyword = self.window_keyword.get().strip()
