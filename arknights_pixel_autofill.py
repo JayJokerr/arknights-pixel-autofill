@@ -510,6 +510,7 @@ class AutoPainter:
         self.coordinate_calibration = None
         self.grid_x_lines = None
         self.grid_y_lines = None
+        self.calibrated_y_shift = 0.0
 
     def stop(self):
         self.stop_event.set()
@@ -656,7 +657,8 @@ class AutoPainter:
         if self.grid_x_lines is not None and self.grid_y_lines is not None:
             return (
                 (self.grid_x_lines[col] + self.grid_x_lines[col + 1]) / 2.0,
-                (self.grid_y_lines[row] + self.grid_y_lines[row + 1]) / 2.0,
+                (self.grid_y_lines[row] + self.grid_y_lines[row + 1]) / 2.0
+                + self.calibrated_y_shift,
             )
         gl, gt = self._scaled(CONFIG["grid_left"], CONFIG["grid_top"], w, h)
         gr, gb = self._scaled(CONFIG["grid_right"], CONFIG["grid_bottom"], w, h)
@@ -701,9 +703,10 @@ class AutoPainter:
         px, py = self._scaled(CONFIG["palette_cols"][col], visible_rows[visible_row], w, h)
         return origin_x + px, origin_y + py
 
-    def paint(self, matrix, keyword, click_delay, skip_white):
+    def paint(self, matrix, keyword, click_delay, skip_white, emulator_mode):
         self.stop_event.clear()
         game_mouse.set_target(None)
+        self.calibrated_y_shift = 0.0
 
         # 客户端在前后台切换时会销毁/重建 Unity 窗口；隐藏的 Arknights Qt
         # 宿主窗口句柄则保持不变。激活宿主后重新查找，直到拿到稳定渲染窗口。
@@ -761,6 +764,9 @@ class AutoPainter:
             detected_w = x_lines[-1] - x_lines[0]
             detected_h = y_lines[-1] - y_lines[0]
             calibration_summary = f"自动校准 {detected_w}×{detected_h}px"
+            if emulator_mode:
+                self.calibrated_y_shift = detected_h / N
+                calibration_summary += "（模拟器模式：下移 1 行）"
             self.app.thread_status(
                 f"已自动校准 24×24 网格：{detected_w}×{detected_h} px，客户区 {w}×{h}"
             )
@@ -1134,6 +1140,7 @@ class App(tk.Tk):
         self.dither = tk.BooleanVar(value=False)
         self.click_delay = tk.DoubleVar(value=0.060)
         self.skip_white = tk.BooleanVar(value=False)
+        self.emulator_mode = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="请选择一张图片。")
         self.file_var = tk.StringVar(value="尚未选择图片")
         self.palette_info_var = tk.StringVar(value="40 色游戏调色板")
@@ -1420,6 +1427,12 @@ class App(tk.Tk):
         ttk.Label(left, text="02  自动化设置", style="Section.TLabel").pack(anchor="w")
         ttk.Label(left, text="游戏窗口标题关键字", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         ttk.Entry(left, textvariable=self.window_keyword, style="Dark.TEntry").pack(fill="x", pady=(2, 6))
+        ttk.Checkbutton(
+            left,
+            text="模拟器模式（校准后画布下移一行）",
+            variable=self.emulator_mode,
+            style="Card.TCheckbutton",
+        ).pack(anchor="w", pady=(0, 4))
 
         speed_line = ttk.Frame(left, style="Card.TFrame")
         speed_line.pack(fill="x")
@@ -1944,10 +1957,11 @@ class App(tk.Tk):
         keyword = self.window_keyword.get().strip()
         delay = max(0.04, float(self.click_delay.get()))
         skip_white = bool(self.skip_white.get())
+        emulator_mode = bool(self.emulator_mode.get())
 
         t = threading.Thread(
             target=self.painter.paint,
-            args=(matrix_copy, keyword, delay, skip_white),
+            args=(matrix_copy, keyword, delay, skip_white, emulator_mode),
             daemon=True,
         )
         t.start()
