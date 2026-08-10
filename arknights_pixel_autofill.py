@@ -34,7 +34,7 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 GITHUB_REPOSITORY = "JayJokerr/arknights-pixel-autofill"
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
@@ -366,25 +366,37 @@ def rgb_to_oklab(rgb):
 OKLAB_PALETTE = [rgb_to_oklab(color) for color in PALETTE]
 
 
-def nearest_palette_index(rgb, perceptual=False, candidates=None):
-    choices = range(len(PALETTE)) if candidates is None else candidates
-    best_i = 0
-    best_d = float("inf")
-    if perceptual:
-        value = rgb_to_oklab(rgb)
-        for i in choices:
-            target = OKLAB_PALETTE[i]
-            d = sum((value[channel] - target[channel]) ** 2 for channel in range(3))
-            if d < best_d:
-                best_d = d
-                best_i = i
+def nearest_palette_index(rgb, perceptual=False, candidates=None, match_strength=1.0):
+    """Return the nearest game color with a controllable RGB/OKLab blend.
+
+    ``match_strength`` is the weight of the algorithm selected by
+    ``perceptual``.  At 100% the result is backward compatible with the old
+    selector; reducing it gradually introduces the other distance model.
+    """
+    choices = list(range(len(PALETTE)) if candidates is None else candidates)
+    strength = max(0.0, min(1.0, float(match_strength)))
+    value = rgb_to_oklab(rgb)
+    rgb_distances = []
+    lab_distances = []
+    for i in choices:
+        rgb_distances.append(color_distance(rgb, PALETTE[i]) ** 0.5 / 765.0)
+        target = OKLAB_PALETTE[i]
+        lab_distances.append(
+            sum((value[channel] - target[channel]) ** 2 for channel in range(3)) ** 0.5
+        )
+
+    if strength >= 0.999:
+        distances = lab_distances if perceptual else rgb_distances
+    elif strength <= 0.001:
+        distances = rgb_distances if perceptual else lab_distances
     else:
-        for i in choices:
-            d = color_distance(rgb, PALETTE[i])
-            if d < best_d:
-                best_d = d
-                best_i = i
-    return best_i
+        selected = lab_distances if perceptual else rgb_distances
+        alternate = rgb_distances if perceptual else lab_distances
+        distances = [
+            strength * primary + (1.0 - strength) * secondary
+            for primary, secondary in zip(selected, alternate)
+        ]
+    return choices[min(range(len(choices)), key=distances.__getitem__)]
 
 
 def flatten_alpha(img):
@@ -402,10 +414,8 @@ RESAMPLE_METHODS = {
 }
 
 
-def resize_to_24(img, mode="crop", resample="Lanczos（原版）"):
-    img = flatten_alpha(img)
-    method = RESAMPLE_METHODS.get(resample, Image.Resampling.LANCZOS)
-
+def _resize_with_method(img, mode, method):
+    """Resize a flattened RGB image with one Pillow sampling method."""
     if mode == "stretch":
         return img.resize((N, N), method)
 
@@ -418,13 +428,18 @@ def resize_to_24(img, mode="crop", resample="Lanczos（原版）"):
         out.paste(tmp, (x, y))
         return out
 
-    # crop：保持比例，居中铺满
-    return ImageOps.fit(
-        img,
-        (N, N),
-        method=method,
-        centering=(0.5, 0.5),
-    )
+    return ImageOps.fit(img, (N, N), method=method, centering=(0.5, 0.5))
+
+
+def resize_to_24(img, mode="crop", resample="Lanczos（原版）", resample_strength=1.0):
+    img = flatten_alpha(img)
+    method = RESAMPLE_METHODS.get(resample, Image.Resampling.LANCZOS)
+    selected = _resize_with_method(img, mode, method)
+    strength = max(0.0, min(1.0, float(resample_strength)))
+    if strength >= 0.999 or method == Image.Resampling.NEAREST:
+        return selected
+    baseline = _resize_with_method(img, mode, Image.Resampling.NEAREST)
+    return Image.blend(baseline, selected, strength)
 
 
 def quantize_image(
@@ -434,8 +449,15 @@ def quantize_image(
     perceptual=False,
     reduce_transitions=False,
     resample="Lanczos（原版）",
+    resample_strength=1.0,
+    match_strength=1.0,
 ):
-    src = resize_to_24(img, mode, resample=resample)
+    src = resize_to_24(
+        img,
+        mode,
+        resample=resample,
+        resample_strength=resample_strength,
+    )
     work = [[[float(v) for v in src.getpixel((x, y))] for x in range(N)] for y in range(N)]
     result = [[3 for _ in range(N)] for _ in range(N)]
 
@@ -454,7 +476,11 @@ def quantize_image(
     for y in range(N):
         for x in range(N):
             old = tuple(int(round(v)) for v in work[y][x])
-            idx = nearest_palette_index(old, perceptual=perceptual)
+            idx = nearest_palette_index(
+                old,
+                perceptual=perceptual,
+                match_strength=match_strength,
+            )
             result[y][x] = idx
 
             if dither:
@@ -477,7 +503,12 @@ def quantize_image(
         retained = sorted(range(len(PALETTE)), key=lambda i: counts[i], reverse=True)[:16]
         result = [
             [
-                nearest_palette_index(src.getpixel((x, y)), perceptual=perceptual, candidates=retained)
+                nearest_palette_index(
+                    src.getpixel((x, y)),
+                    perceptual=perceptual,
+                    candidates=retained,
+                    match_strength=match_strength,
+                )
                 for x in range(N)
             ]
             for y in range(N)
@@ -486,15 +517,133 @@ def quantize_image(
     return result
 
 
-def import_24_bitmap(img, perceptual=False):
+def import_24_bitmap(img, perceptual=False, match_strength=1.0):
     """Map an exact 24x24 bitmap to the game palette without resampling."""
     if img.size != (N, N):
         raise ValueError(f"位图尺寸必须为 {N}×{N}，当前为 {img.width}×{img.height}。")
     src = flatten_alpha(img)
     return [
-        [nearest_palette_index(src.getpixel((x, y)), perceptual=perceptual) for x in range(N)]
+        [
+            nearest_palette_index(
+                src.getpixel((x, y)),
+                perceptual=perceptual,
+                match_strength=match_strength,
+            )
+            for x in range(N)
+        ]
         for y in range(N)
     ]
+
+
+def _dominant_cell_color(image, box):
+    """Sample a flat grid cell while rejecting UID text and compression noise."""
+    left, top, right, bottom = box
+    inset_x = max(1, round((right - left) * 0.10))
+    inset_y = max(1, round((bottom - top) * 0.10))
+    sample = image.crop((left + inset_x, top + inset_y,
+                         right - inset_x, bottom - inset_y))
+    sample_width, sample_height = sample.size
+    pixels = []
+    for y in range(sample_height):
+        for x in range(sample_width):
+            rx = (x + 0.5) / sample_width
+            ry = (y + 0.5) / sample_height
+            if rx <= 0.24 or rx >= 0.76 or ry <= 0.24 or ry >= 0.76:
+                pixels.append(sample.getpixel((x, y)))
+    if not pixels:
+        return (255, 255, 255)
+    buckets = {}
+    for pixel in pixels:
+        key = tuple(int(channel) // 12 for channel in pixel[:3])
+        buckets.setdefault(key, []).append(pixel[:3])
+    dominant = max(buckets.values(), key=len)
+    return tuple(sorted(pixel[channel] for pixel in dominant)[len(dominant) // 2]
+                 for channel in range(3))
+
+
+def detect_official_share_grid(img):
+    """Extract the 24x24 canvas from an official portrait share image.
+
+    Official cards keep a stable portrait layout.  The cyan rounded border is
+    refined near its documented normalized position, then every cell uses a
+    dominant-color vote so repeated UID glyphs do not overwrite the artwork.
+    Returns ``(matrix, bounds, confidence)`` and raises ValueError when the
+    layout cannot be validated.
+    """
+    source = flatten_alpha(ImageOps.exif_transpose(img))
+    width, height = source.size
+    ratio = height / max(1, width)
+    if width < 360 or height < 600 or not 1.45 <= ratio <= 1.95:
+        raise ValueError("图片比例不像官方分享图，请选择完整的竖版分享图片。")
+
+    probe = source.resize((500, round(height * 500 / width)), Image.Resampling.BILINEAR)
+    pw, ph = probe.size
+
+    def cyan(pixel):
+        r, g, b = pixel
+        return g > 145 and b > 155 and r < 145 and g - r > 45 and b - r > 55
+
+    pixels = probe.load()
+    y_scan = range(round(ph * 0.12), round(ph * 0.66))
+    x_scan = range(round(pw * 0.06), round(pw * 0.94))
+
+    def best_vertical(start, end):
+        return max(range(start, end), key=lambda x: sum(cyan(pixels[x, y]) for y in y_scan))
+
+    def best_horizontal(start, end):
+        return max(range(start, end), key=lambda y: sum(cyan(pixels[x, y]) for x in x_scan))
+
+    left_p = best_vertical(round(pw * 0.06), round(pw * 0.16))
+    right_p = best_vertical(round(pw * 0.84), round(pw * 0.94))
+    top_p = best_horizontal(round(ph * 0.11), round(ph * 0.19))
+    bottom_p = best_horizontal(round(ph * 0.56), round(ph * 0.68))
+    grid_w = right_p - left_p
+    grid_h = bottom_p - top_p
+    if grid_w <= 0 or grid_h <= 0 or abs(grid_w - grid_h) > max(grid_w, grid_h) * 0.06:
+        raise ValueError("未能定位官方分享图中的正方形24×24画布。")
+
+    scale = width / pw
+    left = round(left_p * scale)
+    top = round(top_p * scale)
+    right = round(right_p * scale)
+    bottom = round(bottom_p * scale)
+    # Move inside the thick cyan frame before dividing into 24 equal cells.
+    border = max(2, round((right - left) * 0.006))
+    left += border
+    top += border
+    right -= border
+    bottom -= border
+    side = min(right - left, bottom - top)
+    right = left + side
+    bottom = top + side
+
+    matrix = []
+    sampled = []
+    for row in range(N):
+        matrix_row = []
+        sampled_row = []
+        for col in range(N):
+            x0 = round(left + col * side / N)
+            x1 = round(left + (col + 1) * side / N)
+            y0 = round(top + row * side / N)
+            y1 = round(top + (row + 1) * side / N)
+            color = _dominant_cell_color(source, (x0, y0, x1, y1))
+            sampled_row.append(color)
+            matrix_row.append(nearest_palette_index(color, perceptual=True))
+        sampled.append(sampled_row)
+        matrix.append(matrix_row)
+
+    unique_colors = len({value for row in matrix for value in row})
+    if unique_colors < 2:
+        raise ValueError("已定位画布，但没有识别到有效的多色像素内容。")
+    confidence = 1.0 - abs(grid_w - grid_h) / max(grid_w, grid_h)
+    return matrix, (left, top, right, bottom), confidence
+
+
+def matrix_to_image(matrix):
+    image = Image.new("RGB", (N, N))
+    image.putdata([PALETTE[index] for row in matrix for index in row])
+    return image
 
 
 # ---------------------------- Windows 窗口 ----------------------------
@@ -1176,6 +1325,95 @@ class CropDialog(tk.Toplevel):
         self.destroy()
 
 
+class ScreenCaptureDialog(tk.Toplevel):
+    """Full virtual-desktop rectangle selector backed by a frozen screenshot."""
+
+    def __init__(self, parent, screenshot, virtual_bounds):
+        super().__init__(parent)
+        self.result = None
+        self.screenshot = screenshot.convert("RGB")
+        self.virtual_left, self.virtual_top, virtual_w, virtual_h = virtual_bounds
+        self.start = None
+        self.selection_id = None
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.geometry(
+            f"{virtual_w}x{virtual_h}{self.virtual_left:+d}{self.virtual_top:+d}"
+        )
+        self.configure(bg="#000000")
+
+        self.canvas = tk.Canvas(
+            self,
+            width=virtual_w,
+            height=virtual_h,
+            highlightthickness=0,
+            bd=0,
+            cursor="crosshair",
+        )
+        self.canvas.pack(fill="both", expand=True)
+        display = self.screenshot
+        if display.size != (virtual_w, virtual_h):
+            display = display.resize((virtual_w, virtual_h), Image.Resampling.BILINEAR)
+        self.photo = ImageTk.PhotoImage(display)
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self.canvas.create_rectangle(
+            18, 18, 515, 64,
+            fill="#102431", outline="#66d9ef", width=2,
+        )
+        self.canvas.create_text(
+            34, 41,
+            anchor="w",
+            text="拖动选择截图区域 · 松开完成 · Esc / 右键取消",
+            fill="#edf6f7",
+            font=("Microsoft YaHei UI", 12, "bold"),
+        )
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<Button-3>", lambda _event: self._cancel())
+        self.bind("<Escape>", lambda _event: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.grab_set()
+        self.focus_force()
+
+    def _press(self, event):
+        self.start = (event.x, event.y)
+        if self.selection_id is not None:
+            self.canvas.delete(self.selection_id)
+        self.selection_id = self.canvas.create_rectangle(
+            event.x, event.y, event.x, event.y,
+            outline="#f4a23a", width=3,
+        )
+
+    def _drag(self, event):
+        if self.start is None:
+            return
+        self.canvas.coords(self.selection_id, self.start[0], self.start[1], event.x, event.y)
+
+    def _release(self, event):
+        if self.start is None:
+            return
+        left, right = sorted((self.start[0], event.x))
+        top, bottom = sorted((self.start[1], event.y))
+        if right - left < 12 or bottom - top < 12:
+            self.start = None
+            return
+        scale_x = self.screenshot.width / max(1, self.winfo_width())
+        scale_y = self.screenshot.height / max(1, self.winfo_height())
+        box = (
+            max(0, round(left * scale_x)),
+            max(0, round(top * scale_y)),
+            min(self.screenshot.width, round(right * scale_x)),
+            min(self.screenshot.height, round(bottom * scale_y)),
+        )
+        self.result = self.screenshot.crop(box)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 # ---------------------------- GUI ----------------------------
 class App(tk.Tk):
     BASE_PREVIEW_SIZE = 408
@@ -1230,6 +1468,7 @@ class App(tk.Tk):
         self.source_image = None
         self.crop_box = None
         self.direct_bitmap_mode = False
+        self.official_share_mode = False
         self.source_file_name = ""
         self.matrix = [[3] * N for _ in range(N)]
         self.original_matrix = [row[:] for row in self.matrix]
@@ -1238,12 +1477,15 @@ class App(tk.Tk):
         self._stroke_cells = set()
         self.selected_color_index = 0
         self.preview_photo = None
+        self.mini_preview_photo = None
         self.painter = AutoPainter(self)
 
         self.window_keyword = tk.StringVar(value="明日方舟")
         self.fit_mode = tk.StringVar(value="crop")
         self.resample_mode = tk.StringVar(value="Lanczos（原版）")
         self.color_match_mode = tk.StringVar(value="经典RGB（原版）")
+        self.resample_strength = tk.DoubleVar(value=100.0)
+        self.match_strength = tk.DoubleVar(value=100.0)
         self.dither = tk.BooleanVar(value=False)
         self.reduce_transitions = tk.BooleanVar(value=False)
         self.click_delay = tk.DoubleVar(value=0.060)
@@ -1259,10 +1501,12 @@ class App(tk.Tk):
         self._drag_offset = (0, 0)
         self._native_hwnd = None
         self._responsive_after = None
+        self._reprocess_after = None
         self._compact_layout = None
         self._latest_release = None
 
         self._build_ui()
+        self._on_algorithm_slider()
         self._render_preview()
         self._draw_palette()
         self._select_palette_color(0)
@@ -1549,13 +1793,29 @@ class App(tk.Tk):
         )
         self.crop_button.pack(side="left", padx=(self._u(6), 0))
 
+        import_tools = ttk.Frame(left, style="Card.TFrame")
+        import_tools.pack(fill="x", pady=(0, 7))
         self.bitmap_button = ttk.Button(
-            left,
-            text="▦  导入24×24 PNG位图",
+            import_tools,
+            text="▦  24×24位图",
             style="Secondary.TButton",
             command=self.open_24_bitmap,
         )
-        self.bitmap_button.pack(fill="x", pady=(0, 7))
+        self.bitmap_button.pack(side="left", fill="x", expand=True)
+        self.share_button = ttk.Button(
+            import_tools,
+            text="▦  官方分享",
+            style="Secondary.TButton",
+            command=self.open_official_share,
+        )
+        self.share_button.pack(side="left", fill="x", expand=True, padx=(self._u(4), 0))
+        self.capture_button = ttk.Button(
+            import_tools,
+            text="截图",
+            style="Secondary.TButton",
+            command=self.capture_screen,
+        )
+        self.capture_button.pack(side="left", fill="x", expand=True, padx=(self._u(4), 0))
 
         ttk.Label(left, text="缩放方式", style="Muted.TLabel").pack(anchor="w")
         self.mode_box = ttk.Combobox(
@@ -1579,6 +1839,24 @@ class App(tk.Tk):
         self.resample_box.pack(fill="x", pady=(2, 3))
         self.resample_box.bind("<<ComboboxSelected>>", lambda _event: self.reprocess())
 
+        resample_strength_line = ttk.Frame(left, style="Card.TFrame")
+        resample_strength_line.pack(fill="x", pady=(1, 4))
+        ttk.Label(resample_strength_line, text="取样平滑比例", style="Muted.TLabel").pack(side="left")
+        self.resample_strength_label = ttk.Label(
+            resample_strength_line, text="100%", style="Badge.TLabel"
+        )
+        self.resample_strength_label.pack(side="right")
+        self.resample_scale = ttk.Scale(
+            resample_strength_line,
+            from_=0,
+            to=100,
+            variable=self.resample_strength,
+            command=lambda _value: self._on_algorithm_slider(),
+            orient="horizontal",
+            style="Dark.Horizontal.TScale",
+        )
+        self.resample_scale.pack(side="left", fill="x", expand=True, padx=(self._u(5), self._u(5)))
+
         ttk.Label(left, text="颜色匹配算法", style="Muted.TLabel").pack(anchor="w")
         self.match_box = ttk.Combobox(
             left,
@@ -1589,6 +1867,24 @@ class App(tk.Tk):
         )
         self.match_box.pack(fill="x", pady=(2, 3))
         self.match_box.bind("<<ComboboxSelected>>", lambda _event: self.reprocess())
+
+        match_strength_line = ttk.Frame(left, style="Card.TFrame")
+        match_strength_line.pack(fill="x", pady=(1, 4))
+        ttk.Label(match_strength_line, text="所选匹配算法比例", style="Muted.TLabel").pack(side="left")
+        self.match_strength_label = ttk.Label(
+            match_strength_line, text="100%", style="Badge.TLabel"
+        )
+        self.match_strength_label.pack(side="right")
+        self.match_scale = ttk.Scale(
+            match_strength_line,
+            from_=0,
+            to=100,
+            variable=self.match_strength,
+            command=lambda _value: self._on_algorithm_slider(),
+            orient="horizontal",
+            style="Dark.Horizontal.TScale",
+        )
+        self.match_scale.pack(side="left", fill="x", expand=True, padx=(self._u(5), self._u(5)))
 
         self.dither_check = ttk.Checkbutton(
             left,
@@ -1619,9 +1915,9 @@ class App(tk.Tk):
         ttk.Label(speed_line, text="每格点击间隔", style="Muted.TLabel").pack(side="left")
         self.delay_label = ttk.Label(speed_line, text="", style="Badge.TLabel")
         self.delay_label.pack(side="right")
-        delay = ttk.Scale(left, from_=0.04, to=0.12, variable=self.click_delay,
+        delay = ttk.Scale(speed_line, from_=0.04, to=0.12, variable=self.click_delay,
                           orient="horizontal", style="Dark.Horizontal.TScale")
-        delay.pack(fill="x", pady=(3, 2))
+        delay.pack(side="left", fill="x", expand=True, padx=(self._u(5), self._u(5)))
         self.click_delay.trace_add("write", lambda *_: self._update_delay_label())
         self._update_delay_label()
 
@@ -1632,11 +1928,13 @@ class App(tk.Tk):
             style="Card.TCheckbutton",
         ).pack(anchor="w", pady=(2, 7))
 
-        self.start_button = ttk.Button(left, text="▶  开始自动填充", style="Primary.TButton",
+        action_buttons = ttk.Frame(left, style="Card.TFrame")
+        action_buttons.pack(fill="x")
+        self.start_button = ttk.Button(action_buttons, text="▶  开始自动填充", style="Primary.TButton",
                                        command=self.start_paint)
-        self.start_button.pack(fill="x", pady=(0, 5))
-        ttk.Button(left, text="■  停止", style="Danger.TButton",
-                   command=self.stop_paint).pack(fill="x")
+        self.start_button.pack(side="left", fill="x", expand=True)
+        ttk.Button(action_buttons, text="■  停止", style="Danger.TButton",
+                   command=self.stop_paint).pack(side="left", padx=(self._u(5), 0))
 
         self.sidebar_footer_hint = ttk.Label(
             left,
@@ -1705,10 +2003,24 @@ class App(tk.Tk):
         self.preview_info = info
         info.pack(fill="x", pady=(8, 0))
 
-        self.progress = ttk.Progressbar(info, variable=self.progress_var, maximum=100,
+        mini_shell = tk.Frame(info, bg=self.ACCENT, padx=1, pady=1)
+        mini_shell.pack(side="left", padx=(0, self._u(9)))
+        self.mini_preview_canvas = tk.Canvas(
+            mini_shell,
+            width=self._u(70),
+            height=self._u(70),
+            bg="#f8f8f6",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.mini_preview_canvas.pack()
+
+        info_text = ttk.Frame(info, style="Card.TFrame")
+        info_text.pack(side="left", fill="both", expand=True)
+        self.progress = ttk.Progressbar(info_text, variable=self.progress_var, maximum=100,
                                         style="Accent.Horizontal.TProgressbar")
         self.progress.pack(fill="x")
-        ttk.Label(info, textvariable=self.status_var, style="Muted.TLabel",
+        ttk.Label(info_text, textvariable=self.status_var, style="Muted.TLabel",
                   wraplength=self._u(560)).pack(anchor="w", pady=(self._u(6), 0))
 
     def _load_tracer_logo(self):
@@ -1982,6 +2294,7 @@ class App(tk.Tk):
                 text=str(self.matrix[row][col] + 1),
                 fill=self._contrast_text_color(color),
             )
+        self._render_mini_preview()
 
     def _apply_preview_color(self, event):
         if self.source_image is None:
@@ -2052,11 +2365,44 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _on_algorithm_slider(self):
+        try:
+            self.resample_strength_label.configure(
+                text=f"{round(self.resample_strength.get()):d}%"
+            )
+            self.match_strength_label.configure(
+                text=f"{round(self.match_strength.get()):d}%"
+            )
+        except Exception:
+            return
+        if self.source_image is None:
+            return
+        if self._reprocess_after is not None:
+            self.after_cancel(self._reprocess_after)
+        self._reprocess_after = self.after(90, self._run_scheduled_reprocess)
+
+    def _run_scheduled_reprocess(self):
+        self._reprocess_after = None
+        self.reprocess()
+
+    def _cancel_scheduled_reprocess(self):
+        if self._reprocess_after is not None:
+            self.after_cancel(self._reprocess_after)
+            self._reprocess_after = None
+
     def _sync_algorithm_controls(self):
         if self.direct_bitmap_mode or self.reduce_transitions.get():
             self.dither_check.state(["disabled"])
         else:
             self.dither_check.state(["!disabled"])
+        if self.direct_bitmap_mode:
+            self.resample_scale.state(["disabled"])
+        else:
+            self.resample_scale.state(["!disabled"])
+        if self.official_share_mode:
+            self.match_scale.state(["disabled"])
+        else:
+            self.match_scale.state(["!disabled"])
 
     def _perceptual_enabled(self):
         return self.color_match_mode.get().startswith("OKLab")
@@ -2084,25 +2430,115 @@ class App(tk.Tk):
 
         try:
             with Image.open(path) as im:
-                self.source_image = ImageOps.exif_transpose(im).copy()
+                source = ImageOps.exif_transpose(im).copy()
             file_name = Path(path).name
-            self.source_file_name = file_name
-            self.crop_box = None
-            self.direct_bitmap_mode = False
-            display_name = file_name if len(file_name) <= 30 else f"{file_name[:15]}…{file_name[-12:]}"
-            self.file_var.set(display_name)
-            self.status_var.set(f"已载入：{file_name}")
-            self.crop_button.configure(state="normal")
-            self.mode_box.configure(state="readonly")
-            self.resample_box.configure(state="readonly")
-            self.match_box.configure(state="readonly")
-            self.dither_check.state(["!disabled"])
-            self.transition_check.state(["!disabled"])
-            self._sync_algorithm_controls()
-            self.reprocess()
+            self._load_regular_source(source, file_name)
             self.after(60, self.open_crop_editor)
         except Exception as e:
             messagebox.showerror("读取失败", str(e))
+
+    def _load_regular_source(self, image, file_name):
+        self._cancel_scheduled_reprocess()
+        self.source_image = ImageOps.exif_transpose(image).copy()
+        self.source_file_name = file_name
+        self.crop_box = None
+        self.direct_bitmap_mode = False
+        self.official_share_mode = False
+        display_name = file_name if len(file_name) <= 30 else f"{file_name[:15]}…{file_name[-12:]}"
+        self.file_var.set(display_name)
+        self.status_var.set(f"已载入：{file_name}")
+        self.crop_button.configure(state="normal")
+        self.mode_box.configure(state="readonly")
+        self.resample_box.configure(state="readonly")
+        self.match_box.configure(state="readonly")
+        self.dither_check.state(["!disabled"])
+        self.transition_check.state(["!disabled"])
+        self._sync_algorithm_controls()
+        self.reprocess()
+
+    def open_official_share(self):
+        path = filedialog.askopenfilename(
+            title="导入官方分享图",
+            filetypes=[
+                ("官方分享图片", "*.png;*.jpg;*.jpeg;*.webp"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            with Image.open(path) as im:
+                source = ImageOps.exif_transpose(im).copy()
+            matrix, _bounds, confidence = detect_official_share_grid(source)
+        except Exception as exc:
+            messagebox.showerror("分享图导入失败", str(exc))
+            return
+
+        self._load_official_share_source(source, Path(path).name, matrix, confidence)
+
+    def _load_official_share_source(self, source, file_name, matrix=None, confidence=None):
+        self._cancel_scheduled_reprocess()
+        if matrix is None or confidence is None:
+            matrix, _bounds, confidence = detect_official_share_grid(source)
+
+        bitmap = matrix_to_image(matrix)
+        self.source_image = bitmap
+        self.source_file_name = file_name
+        self.crop_box = None
+        self.direct_bitmap_mode = True
+        self.official_share_mode = True
+        self.matrix = matrix
+        self.original_matrix = [row[:] for row in matrix]
+        self.edit_history.clear()
+        display_name = file_name if len(file_name) <= 20 else f"{file_name[:10]}…{file_name[-7:]}"
+        self.file_var.set(f"{display_name}  ·  官方分享图")
+        self.crop_button.configure(state="disabled")
+        self.mode_box.configure(state="disabled")
+        self.resample_box.configure(state="disabled")
+        self.match_box.configure(state="disabled")
+        self.dither_check.state(["disabled"])
+        self.transition_check.state(["disabled"])
+        self._sync_algorithm_controls()
+        self._render_preview()
+        used = len({value for row in matrix for value in row})
+        self._update_matrix_info(
+            f"官方分享图已恢复：自动定位24×24画布并避开UID文字，"
+            f"识别 {used} 种游戏颜色（定位置信度 {confidence:.0%}）。"
+        )
+
+    def capture_screen(self):
+        self.withdraw()
+        self.update_idletasks()
+        time.sleep(0.18)
+        dialog = None
+        try:
+            virtual_left = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            virtual_top = ctypes.windll.user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+            virtual_width = ctypes.windll.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+            virtual_height = ctypes.windll.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+            screenshot = ImageGrab.grab(all_screens=True)
+            dialog = ScreenCaptureDialog(
+                self,
+                screenshot,
+                (virtual_left, virtual_top, virtual_width, virtual_height),
+            )
+            self.wait_window(dialog)
+        except Exception as exc:
+            messagebox.showerror("截图失败", str(exc), parent=self)
+        finally:
+            self.deiconify()
+            self.lift()
+            self.after(30, self._configure_taskbar_window)
+
+        if dialog is None or dialog.result is None:
+            self.status_var.set("已取消截图。")
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self._load_regular_source(dialog.result, f"截图-{stamp}.png")
+        self.status_var.set(
+            f"截图已导入：{dialog.result.width}×{dialog.result.height} px；"
+            "可继续裁切或调整算法比例。"
+        )
 
     def open_24_bitmap(self):
         path = filedialog.askopenfilename(
@@ -2113,11 +2549,16 @@ class App(tk.Tk):
             return
 
         try:
+            self._cancel_scheduled_reprocess()
             with Image.open(path) as im:
                 if im.format != "PNG":
                     raise ValueError("位图直导仅支持 PNG 文件。")
                 bitmap = ImageOps.exif_transpose(im).copy()
-            matrix = import_24_bitmap(bitmap, perceptual=self._perceptual_enabled())
+            matrix = import_24_bitmap(
+                bitmap,
+                perceptual=self._perceptual_enabled(),
+                match_strength=self.match_strength.get() / 100.0,
+            )
         except Exception as e:
             messagebox.showerror("位图导入失败", str(e))
             return
@@ -2127,6 +2568,7 @@ class App(tk.Tk):
         self.source_file_name = file_name
         self.crop_box = None
         self.direct_bitmap_mode = True
+        self.official_share_mode = False
         self.matrix = matrix
         self.original_matrix = [row[:] for row in matrix]
         self.edit_history.clear()
@@ -2138,6 +2580,7 @@ class App(tk.Tk):
         self.match_box.configure(state="readonly")
         self.dither_check.state(["disabled"])
         self.transition_check.state(["disabled"])
+        self._sync_algorithm_controls()
         self._render_preview()
         used = len({value for row in matrix for value in row})
         self._update_matrix_info(
@@ -2172,6 +2615,7 @@ class App(tk.Tk):
             self.matrix = import_24_bitmap(
                 self.source_image,
                 perceptual=self._perceptual_enabled(),
+                match_strength=self.match_strength.get() / 100.0,
             )
             self.original_matrix = [row[:] for row in self.matrix]
             self.edit_history.clear()
@@ -2191,6 +2635,8 @@ class App(tk.Tk):
             dither=self.dither.get(),
             perceptual=self._perceptual_enabled(),
             reduce_transitions=self.reduce_transitions.get(),
+            resample_strength=self.resample_strength.get() / 100.0,
+            match_strength=self.match_strength.get() / 100.0,
         )
         self.original_matrix = [row[:] for row in self.matrix]
         self.edit_history.clear()
@@ -2200,8 +2646,11 @@ class App(tk.Tk):
         match_name = "OKLab" if self._perceptual_enabled() else "经典RGB"
         resample_name = self.resample_mode.get().split("（", 1)[0]
         transition_name = "，已减少过渡色" if self.reduce_transitions.get() else ""
+        resample_ratio = round(self.resample_strength.get())
+        match_ratio = round(self.match_strength.get())
         self._update_matrix_info(
-            f"转换完成：{resample_name}＋{match_name}{transition_name}，"
+            f"转换完成：{resample_name} {resample_ratio}%＋{match_name} {match_ratio}%"
+            f"{transition_name}，"
             f"共使用 {used} 种游戏颜色；可继续修改。"
         )
 
@@ -2283,6 +2732,27 @@ class App(tk.Tk):
                     fill=self.ACCENT_DARK if multiple == 12 else self.BORDER,
                     width=strong_width,
                 )
+
+        self._render_mini_preview()
+
+    def _render_mini_preview(self):
+        if not hasattr(self, "mini_preview_canvas"):
+            return
+        preview = matrix_to_image(self.matrix)
+        width = max(24, self.mini_preview_canvas.winfo_width(),
+                    self.mini_preview_canvas.winfo_reqwidth())
+        height = max(24, self.mini_preview_canvas.winfo_height(),
+                     self.mini_preview_canvas.winfo_reqheight())
+        side = min(width, height)
+        preview = preview.resize((side, side), Image.Resampling.NEAREST)
+        self.mini_preview_photo = ImageTk.PhotoImage(preview)
+        self.mini_preview_canvas.delete("all")
+        self.mini_preview_canvas.create_image(
+            width / 2,
+            height / 2,
+            anchor="center",
+            image=self.mini_preview_photo,
+        )
 
     # ---------------------------- 在线更新 ----------------------------
     @staticmethod

@@ -28,7 +28,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='明日方舟像素画自动填色',
+    name='Arknights-Pixel-Autofill',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

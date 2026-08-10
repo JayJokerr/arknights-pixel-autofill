@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .build_env/
+.build_env_tk/
 .venv/
 venv/
 
