@@ -3,7 +3,7 @@ from unittest import mock
 
 from PIL import Image
 
-import arknights_pixel_autofill as app_module
+from arknights_pixel import automation as app_module
 
 
 class SurfaceSelectionTests(unittest.TestCase):

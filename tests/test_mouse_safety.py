@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-import arknights_pixel_autofill as app_module
+from arknights_pixel import automation as app_module
 
 
 class MouseSafetyTests(unittest.TestCase):

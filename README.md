@@ -273,7 +273,7 @@ pyinstaller --noconfirm --clean arknights_pixel_autofill.spec
 ## 项目结构
 
 - `arknights_pixel_qt.py`：v1.4.0 PySide6主界面与用户交互入口。
-- `arknights_pixel_autofill.py`：Windows窗口、鼠标输入、动态自动填充后端及旧界面兼容代码。
+- `arknights_pixel/automation.py`：Windows窗口枚举、鼠标输入、动态画布/调色板定位和自动填充后端。
 - `arknights_pixel/palette.py`：游戏40色色盘、经典RGB与OKLab颜色距离。
 - `arknights_pixel/image_processing.py`：缩放、结构增强、量化、过渡色控制和24×24位图直导。
 - `arknights_pixel/vision.py`：画布、动态调色板和官方分享图识别。
