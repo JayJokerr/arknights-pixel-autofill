@@ -34,7 +34,7 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 GITHUB_REPOSITORY = "JayJokerr/arknights-pixel-autofill"
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
@@ -170,9 +170,61 @@ class GameMouse:
         self.pause = 0.01
         self.target_hwnd = None
         self.last_position = None
+        self.cursor_clipped = False
+        self.relative_compat = False
 
     def set_target(self, hwnd):
+        if hwnd is None:
+            self.release_cursor()
         self.target_hwnd = hwnd
+        # Native PC Unity clients may consume Raw Input and ignore an absolute
+        # move.  Emulator/Qt/Chromium render surfaces do not need that
+        # workaround; sending a relative delta there makes Windows pointer
+        # acceleration visibly overshoot before the absolute correction.
+        self.relative_compat = False
+        if hwnd:
+            try:
+                self.relative_compat = win32gui.GetClassName(hwnd) == "UnityWndClass"
+            except Exception:
+                pass
+
+    def _target_client_rect(self):
+        """Return target client bounds in physical virtual-screen pixels."""
+        hwnd = self.target_hwnd
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return None
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        screen_left, screen_top = win32gui.ClientToScreen(hwnd, (left, top))
+        screen_right, screen_bottom = win32gui.ClientToScreen(hwnd, (right, bottom))
+        if screen_right <= screen_left or screen_bottom <= screen_top:
+            return None
+        return screen_left, screen_top, screen_right, screen_bottom
+
+    def _clamp_to_target(self, x, y):
+        bounds = self._target_client_rect()
+        if bounds is None:
+            return round(x), round(y)
+        left, top, right, bottom = bounds
+        # Keep a small inset because right/bottom are exclusive Win32 bounds.
+        return (
+            max(left + 2, min(right - 3, round(x))),
+            max(top + 2, min(bottom - 3, round(y))),
+        )
+
+    def clip_to_target(self):
+        """Confine the real cursor to the selected game client while painting."""
+        bounds = self._target_client_rect()
+        if bounds is None:
+            raise InputInjectionError("无法读取游戏客户区，未启用光标保护。")
+        rect = wintypes.RECT(*bounds)
+        if not self.user32.ClipCursor(ctypes.byref(rect)):
+            raise InputInjectionError("Windows 无法将鼠标约束到游戏窗口。")
+        self.cursor_clipped = True
+
+    def release_cursor(self):
+        if self.cursor_clipped:
+            self.user32.ClipCursor(None)
+            self.cursor_clipped = False
 
     @staticmethod
     def _make_lparam(x, y):
@@ -180,7 +232,7 @@ class GameMouse:
 
     def _post_move(self, screen_x, screen_y):
         hwnd = self.target_hwnd
-        if not hwnd or not win32gui.IsWindow(hwnd):
+        if not self.relative_compat or not hwnd or not win32gui.IsWindow(hwnd):
             return
         try:
             client_x, client_y = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
@@ -218,21 +270,16 @@ class GameMouse:
         return True
 
     def move_to(self, x, y, duration=0.0):
-        x = round(x)
-        y = round(y)
+        x, y = self._clamp_to_target(x, y)
 
-        # Unity 客户端聚焦后可能只读取 Raw Input 的相对位移，单纯发送
-        # MOUSEEVENTF_ABSOLUTE 会表现为“游戏外能动，游戏内不动”。先发送一次
-        # 相对增量给游戏，再用绝对事件校准 Windows 系统光标，兼容两种路径。
-        point = wintypes.POINT()
-        if self.user32.GetCursorPos(ctypes.byref(point)):
-            dx = x - point.x
-            dy = y - point.y
-            if dx or dy:
-                self._send(self.MOVE | self.MOVE_NOCOALESCE, dx, dy)
-                # 相对位移会受到 Windows 指针加速影响，立即把系统光标拉回目标；
-                # 游戏的 Raw Input 已经收到上面的原始增量。
-                self.user32.SetCursorPos(x, y)
+        if self.relative_compat:
+            # Raw Input compatibility is opt-in for the native Unity surface.
+            point = wintypes.POINT()
+            if self.user32.GetCursorPos(ctypes.byref(point)):
+                dx = x - point.x
+                dy = y - point.y
+                if dx or dy:
+                    self._send(self.MOVE | self.MOVE_NOCOALESCE, dx, dy)
 
         # 使用虚拟桌面坐标，兼容游戏位于副屏以及副屏在主屏左侧/上方的情况。
         vx = self.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
@@ -244,6 +291,10 @@ class GameMouse:
         nx = max(0, min(65535, nx))
         ny = max(0, min(65535, ny))
         self._send(self.MOVE | self.ABSOLUTE | self.VIRTUALDESK, nx, ny)
+        # SetCursorPos is an absolute correction and is not affected by mouse
+        # acceleration.  It also makes the visible cursor deterministic when
+        # an emulator coalesces consecutive SendInput move events.
+        self.user32.SetCursorPos(x, y)
         self.last_position = (x, y)
         self._post_move(x, y)
         if duration > self.pause:
@@ -257,7 +308,7 @@ class GameMouse:
 
         # 某些 Unity 客户端锁定系统光标，但仍由窗口消息更新 UI 指针。
         hwnd = self.target_hwnd
-        if hwnd and self.last_position and win32gui.IsWindow(hwnd):
+        if self.relative_compat and hwnd and self.last_position and win32gui.IsWindow(hwnd):
             try:
                 cx, cy = win32gui.ScreenToClient(hwnd, self.last_position)
                 lp = self._make_lparam(cx, cy)
@@ -267,10 +318,28 @@ class GameMouse:
             except Exception:
                 pass
 
+    def drag_to(self, x, y, duration=0.48):
+        """Drag through real intermediate positions for Unity/Raw Input UIs."""
+        if self.last_position is None:
+            self.move_to(x, y)
+            return
+        start_x, start_y = self.last_position
+        self._send(self.LEFTDOWN)
+        steps = max(8, round(duration / 0.025))
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            eased = ratio * ratio * (3.0 - 2.0 * ratio)
+            self.move_to(
+                start_x + (x - start_x) * eased,
+                start_y + (y - start_y) * eased,
+            )
+            time.sleep(max(0.0, duration / steps - self.pause))
+        self._send(self.LEFTUP)
+
     def scroll(self, clicks):
         self._send(self.WHEEL, data=int(clicks * self.WHEEL_DELTA))
         hwnd = self.target_hwnd
-        if hwnd and self.last_position and win32gui.IsWindow(hwnd):
+        if self.relative_compat and hwnd and self.last_position and win32gui.IsWindow(hwnd):
             try:
                 sx, sy = self.last_position
                 wp = (int(clicks * self.WHEEL_DELTA) & 0xFFFF) << 16
@@ -330,404 +399,181 @@ CONFIG = {
     "palette_bottom_first_global_row": 4,
 }
 
-# ---------------------------- 图像算法 ----------------------------
-def color_distance(c1, c2):
-    """CompuPhase RGB perceptual-ish distance."""
-    r1, g1, b1 = c1
-    r2, g2, b2 = c2
-    rmean = (r1 + r2) / 2.0
-    dr = r1 - r2
-    dg = g1 - g2
-    db = b1 - b2
-    return (2.0 + rmean / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rmean) / 256.0) * db * db
-
-
-def _srgb_to_linear(value):
-    value = max(0.0, min(255.0, float(value))) / 255.0
-    return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
-
-
-def rgb_to_oklab(rgb):
-    """Convert an sRGB triplet to OKLab for perceptual color comparison."""
-    r, g, b = (_srgb_to_linear(value) for value in rgb)
-    ll = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
-    mm = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
-    ss = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
-    l = max(0.0, ll) ** (1.0 / 3.0)
-    m = max(0.0, mm) ** (1.0 / 3.0)
-    s = max(0.0, ss) ** (1.0 / 3.0)
-    return (
-        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
-        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
-        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
-    )
-
-
-OKLAB_PALETTE = [rgb_to_oklab(color) for color in PALETTE]
-
-
-def nearest_palette_index(rgb, perceptual=False, candidates=None, match_strength=1.0):
-    """Return the nearest game color with a controllable RGB/OKLab blend.
-
-    ``match_strength`` is the weight of the algorithm selected by
-    ``perceptual``.  At 100% the result is backward compatible with the old
-    selector; reducing it gradually introduces the other distance model.
-    """
-    choices = list(range(len(PALETTE)) if candidates is None else candidates)
-    strength = max(0.0, min(1.0, float(match_strength)))
-    value = rgb_to_oklab(rgb)
-    rgb_distances = []
-    lab_distances = []
-    for i in choices:
-        rgb_distances.append(color_distance(rgb, PALETTE[i]) ** 0.5 / 765.0)
-        target = OKLAB_PALETTE[i]
-        lab_distances.append(
-            sum((value[channel] - target[channel]) ** 2 for channel in range(3)) ** 0.5
-        )
-
-    if strength >= 0.999:
-        distances = lab_distances if perceptual else rgb_distances
-    elif strength <= 0.001:
-        distances = rgb_distances if perceptual else lab_distances
-    else:
-        selected = lab_distances if perceptual else rgb_distances
-        alternate = rgb_distances if perceptual else lab_distances
-        distances = [
-            strength * primary + (1.0 - strength) * secondary
-            for primary, secondary in zip(selected, alternate)
-        ]
-    return choices[min(range(len(choices)), key=distances.__getitem__)]
-
-
-def flatten_alpha(img):
-    img = img.convert("RGBA")
-    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-    bg.alpha_composite(img)
-    return bg.convert("RGB")
-
-
-RESAMPLE_METHODS = {
-    "Lanczos（原版）": Image.Resampling.LANCZOS,
-    "BOX（减少混色）": Image.Resampling.BOX,
-    "Bicubic（柔和）": Image.Resampling.BICUBIC,
-    "Nearest（像素画）": Image.Resampling.NEAREST,
-}
-
-
-def _resize_with_method(img, mode, method):
-    """Resize a flattened RGB image with one Pillow sampling method."""
-    if mode == "stretch":
-        return img.resize((N, N), method)
-
-    if mode == "contain":
-        out = Image.new("RGB", (N, N), (255, 255, 255))
-        tmp = img.copy()
-        tmp.thumbnail((N, N), method)
-        x = (N - tmp.width) // 2
-        y = (N - tmp.height) // 2
-        out.paste(tmp, (x, y))
-        return out
-
-    return ImageOps.fit(img, (N, N), method=method, centering=(0.5, 0.5))
-
-
-def resize_to_24(img, mode="crop", resample="Lanczos（原版）", resample_strength=1.0):
-    img = flatten_alpha(img)
-    method = RESAMPLE_METHODS.get(resample, Image.Resampling.LANCZOS)
-    selected = _resize_with_method(img, mode, method)
-    strength = max(0.0, min(1.0, float(resample_strength)))
-    if strength >= 0.999 or method == Image.Resampling.NEAREST:
-        return selected
-    baseline = _resize_with_method(img, mode, Image.Resampling.NEAREST)
-    return Image.blend(baseline, selected, strength)
-
-
-def quantize_image(
-    img,
-    mode="crop",
-    dither=False,
-    perceptual=False,
-    reduce_transitions=False,
-    resample="Lanczos（原版）",
-    resample_strength=1.0,
-    match_strength=1.0,
-):
-    src = resize_to_24(
-        img,
-        mode,
-        resample=resample,
-        resample_strength=resample_strength,
-    )
-    work = [[[float(v) for v in src.getpixel((x, y))] for x in range(N)] for y in range(N)]
-    result = [[3 for _ in range(N)] for _ in range(N)]
-
-    # Error diffusion deliberately creates intermediate color patterns, so the
-    # transition-reduction mode always uses clean, non-dithered color blocks.
-    if reduce_transitions:
-        dither = False
-
-    def add_error(x, y, er, eg, eb, factor):
-        if 0 <= x < N and 0 <= y < N:
-            p = work[y][x]
-            p[0] = max(0.0, min(255.0, p[0] + er * factor))
-            p[1] = max(0.0, min(255.0, p[1] + eg * factor))
-            p[2] = max(0.0, min(255.0, p[2] + eb * factor))
-
-    for y in range(N):
-        for x in range(N):
-            old = tuple(int(round(v)) for v in work[y][x])
-            idx = nearest_palette_index(
-                old,
-                perceptual=perceptual,
-                match_strength=match_strength,
-            )
-            result[y][x] = idx
-
-            if dither:
-                nr, ng, nb = PALETTE[idx]
-                er = old[0] - nr
-                eg = old[1] - ng
-                eb = old[2] - nb
-                add_error(x + 1, y,     er, eg, eb, 7 / 16)
-                add_error(x - 1, y + 1, er, eg, eb, 3 / 16)
-                add_error(x,     y + 1, er, eg, eb, 5 / 16)
-                add_error(x + 1, y + 1, er, eg, eb, 1 / 16)
-
-    if reduce_transitions:
-        # Keep the 16 colors that contribute most to this picture, then remap
-        # the low-frequency transition shades to their closest retained color.
-        counts = [0] * len(PALETTE)
-        for row in result:
-            for index in row:
-                counts[index] += 1
-        retained = sorted(range(len(PALETTE)), key=lambda i: counts[i], reverse=True)[:16]
-        result = [
-            [
-                nearest_palette_index(
-                    src.getpixel((x, y)),
-                    perceptual=perceptual,
-                    candidates=retained,
-                    match_strength=match_strength,
-                )
-                for x in range(N)
-            ]
-            for y in range(N)
-        ]
-
-    return result
-
-
-def import_24_bitmap(img, perceptual=False, match_strength=1.0):
-    """Map an exact 24x24 bitmap to the game palette without resampling."""
-    if img.size != (N, N):
-        raise ValueError(f"位图尺寸必须为 {N}×{N}，当前为 {img.width}×{img.height}。")
-    src = flatten_alpha(img)
-    return [
-        [
-            nearest_palette_index(
-                src.getpixel((x, y)),
-                perceptual=perceptual,
-                match_strength=match_strength,
-            )
-            for x in range(N)
-        ]
-        for y in range(N)
-    ]
-
-
-def _dominant_cell_color(image, box):
-    """Sample a flat grid cell while rejecting UID text and compression noise."""
-    left, top, right, bottom = box
-    inset_x = max(1, round((right - left) * 0.10))
-    inset_y = max(1, round((bottom - top) * 0.10))
-    sample = image.crop((left + inset_x, top + inset_y,
-                         right - inset_x, bottom - inset_y))
-    sample_width, sample_height = sample.size
-    pixels = []
-    for y in range(sample_height):
-        for x in range(sample_width):
-            rx = (x + 0.5) / sample_width
-            ry = (y + 0.5) / sample_height
-            if rx <= 0.24 or rx >= 0.76 or ry <= 0.24 or ry >= 0.76:
-                pixels.append(sample.getpixel((x, y)))
-    if not pixels:
-        return (255, 255, 255)
-    buckets = {}
-    for pixel in pixels:
-        key = tuple(int(channel) // 12 for channel in pixel[:3])
-        buckets.setdefault(key, []).append(pixel[:3])
-    dominant = max(buckets.values(), key=len)
-    return tuple(sorted(pixel[channel] for pixel in dominant)[len(dominant) // 2]
-                 for channel in range(3))
-
-
-def detect_official_share_grid(img):
-    """Extract the 24x24 canvas from an official portrait share image.
-
-    Official cards keep a stable portrait layout.  The cyan rounded border is
-    refined near its documented normalized position, then every cell uses a
-    dominant-color vote so repeated UID glyphs do not overwrite the artwork.
-    Returns ``(matrix, bounds, confidence)`` and raises ValueError when the
-    layout cannot be validated.
-    """
-    source = flatten_alpha(ImageOps.exif_transpose(img))
-    width, height = source.size
-    ratio = height / max(1, width)
-    if width < 360 or height < 600 or not 1.45 <= ratio <= 1.95:
-        raise ValueError("图片比例不像官方分享图，请选择完整的竖版分享图片。")
-
-    probe = source.resize((500, round(height * 500 / width)), Image.Resampling.BILINEAR)
-    pw, ph = probe.size
-
-    def cyan(pixel):
-        r, g, b = pixel
-        return g > 145 and b > 155 and r < 145 and g - r > 45 and b - r > 55
-
-    pixels = probe.load()
-    y_scan = range(round(ph * 0.12), round(ph * 0.66))
-    x_scan = range(round(pw * 0.06), round(pw * 0.94))
-
-    def best_vertical(start, end):
-        return max(range(start, end), key=lambda x: sum(cyan(pixels[x, y]) for y in y_scan))
-
-    def best_horizontal(start, end):
-        return max(range(start, end), key=lambda y: sum(cyan(pixels[x, y]) for x in x_scan))
-
-    left_p = best_vertical(round(pw * 0.06), round(pw * 0.16))
-    right_p = best_vertical(round(pw * 0.84), round(pw * 0.94))
-    top_p = best_horizontal(round(ph * 0.11), round(ph * 0.19))
-    bottom_p = best_horizontal(round(ph * 0.56), round(ph * 0.68))
-    grid_w = right_p - left_p
-    grid_h = bottom_p - top_p
-    if grid_w <= 0 or grid_h <= 0 or abs(grid_w - grid_h) > max(grid_w, grid_h) * 0.06:
-        raise ValueError("未能定位官方分享图中的正方形24×24画布。")
-
-    scale = width / pw
-    left = round(left_p * scale)
-    top = round(top_p * scale)
-    right = round(right_p * scale)
-    bottom = round(bottom_p * scale)
-    # Move inside the thick cyan frame before dividing into 24 equal cells.
-    border = max(2, round((right - left) * 0.006))
-    left += border
-    top += border
-    right -= border
-    bottom -= border
-    side = min(right - left, bottom - top)
-    right = left + side
-    bottom = top + side
-
-    matrix = []
-    sampled = []
-    for row in range(N):
-        matrix_row = []
-        sampled_row = []
-        for col in range(N):
-            x0 = round(left + col * side / N)
-            x1 = round(left + (col + 1) * side / N)
-            y0 = round(top + row * side / N)
-            y1 = round(top + (row + 1) * side / N)
-            color = _dominant_cell_color(source, (x0, y0, x1, y1))
-            sampled_row.append(color)
-            matrix_row.append(nearest_palette_index(color, perceptual=True))
-        sampled.append(sampled_row)
-        matrix.append(matrix_row)
-
-    unique_colors = len({value for row in matrix for value in row})
-    if unique_colors < 2:
-        raise ValueError("已定位画布，但没有识别到有效的多色像素内容。")
-    confidence = 1.0 - abs(grid_w - grid_h) / max(grid_w, grid_h)
-    return matrix, (left, top, right, bottom), confidence
-
-
-def matrix_to_image(matrix):
-    image = Image.new("RGB", (N, N))
-    image.putdata([PALETTE[index] for row in matrix for index in row])
-    return image
+# ---------------------------- Core modules ----------------------------
+# Image processing and recognition stay importable without Tk or Win32, so
+# their tests and future maintenance do not depend on a Windows input session.
+from arknights_pixel.image_processing import (
+    RESAMPLE_METHODS,
+    flatten_alpha,
+    import_24_bitmap,
+    matrix_to_image,
+    quantize_image,
+)
+from arknights_pixel.layout import calculate_ui_scale, responsive_metrics
+from arknights_pixel.vision import (
+    GridLayout,
+    PaletteLayout,
+    detect_canvas_grid,
+    detect_canvas_grid_dynamic,
+    detect_official_share_grid,
+    detect_palette_layout,
+)
 
 
 # ---------------------------- Windows 窗口 ----------------------------
-def find_game_window(keyword):
-    windows = []
+def list_selectable_windows():
+    """Return user-facing top-level windows suitable for explicit selection."""
+    result = []
     own_pid = os.getpid()
 
-    def enum_cb(hwnd, _):
+    def callback(hwnd, _):
         try:
-            title = win32gui.GetWindowText(hwnd)
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd).strip()
+            if not title:
+                return True
+            # Exclude this tool even when another packaged instance is open.
+            # Checking only own_pid would leave an older EXE in the picker and
+            # its title also contains “明日方舟”.
+            if "24×24" in title and ("像素画自动填色" in title or "PIXEL LAB" in title):
+                return True
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            visible = bool(win32gui.IsWindowVisible(hwnd))
-            iconic = bool(win32gui.IsIconic(hwnd))
-            left, top, right, bottom = win32gui.GetClientRect(hwnd)
-            area = max(0, right - left) * max(0, bottom - top)
+            if pid == own_pid:
+                return True
+            _left, _top, right, bottom = win32gui.GetClientRect(hwnd)
+            width, height = max(0, right), max(0, bottom)
+            if width < 480 or height < 270:
+                return True
             class_name = win32gui.GetClassName(hwnd)
+            if class_name in ("Shell_TrayWnd", "Progman", "WorkerW"):
+                return True
+            result.append({
+                "hwnd": int(hwnd), "pid": int(pid), "title": title,
+                "width": width, "height": height, "class": class_name,
+            })
         except Exception:
-            return True
-
-        windows.append({
-            "hwnd": hwnd,
-            "title": title,
-            "pid": pid,
-            "visible": visible,
-            "iconic": iconic,
-            "area": area,
-            "class": class_name,
-        })
+            pass
         return True
 
-    win32gui.EnumWindows(enum_cb, None)
-    needle = keyword.strip().lower()
+    try:
+        win32gui.EnumWindows(callback, None)
+    except Exception:
+        # Some restricted Windows sessions deny enumeration temporarily.  The
+        # UI should still stay usable and allow a later manual refresh.
+        return []
+    result.sort(key=lambda item: (
+        "明日方舟" not in item["title"],
+        item["class"] != "UnityWndClass",
+        item["title"].lower(),
+    ))
+    return result
 
-    def is_tool_window(item):
-        title = item["title"]
-        return item["pid"] == own_pid or (
-            item["class"] == "TkTopLevel"
-            and "24×24" in title
-            and "自动填色" in title
-        )
 
-    # 工具自身标题也包含“明日方舟”，必须排除自身进程。游戏客户端可能用一个
-    # 隐藏的 UnityWndClass 保存中文标题，而真正可见的渲染窗口标题为 Arknights；
-    # 因此先由任意标题命中的窗口确定游戏 PID，再选择同进程的可见窗口。
-    related_pids = {
-        item["pid"]
-        for item in windows
-        if not is_tool_window(item)
-        and needle
-        and needle in item["title"].lower()
-    }
-
-    matches = [
-        item
-        for item in windows
-        if not is_tool_window(item)
-        and (
-            item["visible"]
-            or item["iconic"]
-            or item["title"].strip().lower() == "arknights"
-        )
-        and (item["area"] > 0 or item["iconic"])
-        and (
-            item["pid"] in related_pids
-            or (needle and needle in item["title"].lower())
-            or item["title"].strip().lower() == "arknights"
-        )
-    ]
-
-    if not matches:
+def resolve_selected_window(target):
+    """Resolve the user-selected shell; visual surface selection happens later."""
+    if not target:
         return None, None
+    hwnd = int(target.get("hwnd", 0))
+    if hwnd and win32gui.IsWindow(hwnd):
+        return hwnd, win32gui.GetWindowText(hwnd) or target.get("title", "")
 
-    # 同进程可能同时存在 Qt 辅助窗口和真正的 Unity 渲染窗口。最小化时
-    # Unity 客户区会暂时成为 0×0，所以先按窗口类别、再按面积选择。
-    matches.sort(
-        key=lambda item: (
-            item["class"] == "UnityWndClass",
-            item["visible"],
-            item["area"],
-        ),
-        reverse=True,
-    )
-    best = matches[0]
-    return best["hwnd"], best["title"]
+    candidates = []
+    target_pid = int(target.get("pid", 0))
+
+    def callback(candidate, _):
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(candidate)
+            if pid != target_pid:
+                return True
+            title = win32gui.GetWindowText(candidate)
+            left, top, right, bottom = win32gui.GetClientRect(candidate)
+            area = max(0, right - left) * max(0, bottom - top)
+            candidates.append((
+                win32gui.GetClassName(candidate) == "UnityWndClass",
+                win32gui.IsWindowVisible(candidate), area, candidate, title,
+            ))
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(callback, None)
+    except Exception:
+        return None, None
+    if not candidates:
+        return None, None
+    candidates.sort(reverse=True)
+    return candidates[0][3], candidates[0][4]
+
+
+def list_visual_surface_candidates(host_hwnd):
+    """Collect generic client surfaces related to a selected game window.
+
+    This deliberately contains no emulator brand, class-name or fixed toolbar
+    assumptions.  It includes the selected client itself, all descendants
+    (including cross-process render children), and overlapping same-process or
+    owned top-level surfaces.  Pixels decide which candidate is the game.
+    """
+    if not host_hwnd or not win32gui.IsWindow(host_hwnd):
+        return []
+    try:
+        host_ox, host_oy, host_w, host_h = get_client_info(host_hwnd)
+        _, host_pid = win32process.GetWindowThreadProcessId(host_hwnd)
+    except Exception:
+        return []
+    host_rect = (host_ox, host_oy, host_ox + host_w, host_oy + host_h)
+    handles = [host_hwnd]
+
+    def add_descendant(candidate, _):
+        if candidate not in handles:
+            handles.append(candidate)
+        return True
+
+    try:
+        win32gui.EnumChildWindows(host_hwnd, add_descendant, None)
+    except Exception:
+        pass
+
+    def add_related_top_level(candidate, _):
+        try:
+            if candidate in handles or not win32gui.IsWindowVisible(candidate):
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(candidate)
+            owner = win32gui.GetWindow(candidate, win32con.GW_OWNER)
+            if pid == host_pid or owner == host_hwnd:
+                handles.append(candidate)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(add_related_top_level, None)
+    except Exception:
+        pass
+
+    result = []
+    for hwnd in handles:
+        try:
+            ox, oy, width, height = get_client_info(hwnd)
+            if width < 640 or height < 360:
+                continue
+            rect = (ox, oy, ox + width, oy + height)
+            overlap_w = max(0, min(host_rect[2], rect[2]) - max(host_rect[0], rect[0]))
+            overlap_h = max(0, min(host_rect[3], rect[3]) - max(host_rect[1], rect[1]))
+            overlap = overlap_w * overlap_h / max(1, width * height)
+            if hwnd != host_hwnd and overlap < 0.55:
+                continue
+            result.append({
+                "hwnd": int(hwnd), "origin_x": ox, "origin_y": oy,
+                "width": width, "height": height, "overlap": overlap,
+            })
+        except Exception:
+            continue
+    # Stable order makes diagnostics and tests deterministic; it does not
+    # choose the winner.  Visual validation below does that.
+    result.sort(key=lambda item: (item["hwnd"] != host_hwnd, -item["width"] * item["height"]))
+    return result
 
 
 def get_client_info(hwnd):
@@ -739,23 +585,58 @@ def get_client_info(hwnd):
 
 
 def focus_window(hwnd):
+    def is_target_foreground():
+        try:
+            foreground = win32gui.GetForegroundWindow()
+            if foreground == hwnd or win32gui.IsChild(hwnd, foreground):
+                return True
+            _, foreground_pid = win32process.GetWindowThreadProcessId(foreground)
+            _, target_pid = win32process.GetWindowThreadProcessId(hwnd)
+            return foreground_pid == target_pid
+        except Exception:
+            return False
+
     try:
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             time.sleep(0.3)
         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        win32gui.BringWindowToTop(hwnd)
         win32gui.SetForegroundWindow(hwnd)
-        time.sleep(0.5)
-        return True
-    except Exception:
-        # Windows 有时禁止后台程序抢焦点，尝试鼠标点击客户区顶部空白处
-        try:
-            ox, oy, w, h = get_client_info(hwnd)
-            game_mouse.click(ox + w // 2, oy + 30)
-            time.sleep(0.4)
+        time.sleep(0.15)
+        if is_target_foreground():
             return True
+    except Exception:
+        pass
+
+    # Windows foreground-lock rules can ignore SetForegroundWindow without
+    # raising.  Temporarily attach this thread's input queue to the current
+    # foreground and target queues, bring the target forward, then verify.
+    user32 = ctypes.windll.user32
+    current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+    foreground = win32gui.GetForegroundWindow()
+    foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    attached = []
+    try:
+        for thread_id in {foreground_thread, target_thread}:
+            if thread_id and thread_id != current_thread:
+                if user32.AttachThreadInput(current_thread, thread_id, True):
+                    attached.append(thread_id)
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        win32gui.BringWindowToTop(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+        try:
+            win32gui.SetFocus(hwnd)
         except Exception:
-            return False
+            pass
+        time.sleep(0.2)
+        return is_target_foreground()
+    except Exception:
+        return False
+    finally:
+        for thread_id in reversed(attached):
+            user32.AttachThreadInput(current_thread, thread_id, False)
 
 
 # ---------------------------- 自动绘制 ----------------------------
@@ -766,9 +647,26 @@ class AutoPainter:
         self.coordinate_calibration = None
         self.grid_x_lines = None
         self.grid_y_lines = None
+        self.palette_layout = None
+        self.paint_lock = threading.Lock()
+        self.active_surface = None
 
     def stop(self):
         self.stop_event.set()
+        game_mouse.release_cursor()
+
+    def _surface_is_stable(self):
+        if not self.active_surface:
+            return False
+        try:
+            hwnd, ox, oy, width, height = self.active_surface
+            return win32gui.IsWindow(hwnd) and get_client_info(hwnd) == (ox, oy, width, height)
+        except Exception:
+            return False
+
+    def _ensure_surface_stable(self):
+        if not self._surface_is_stable():
+            raise RuntimeError("游戏窗口的位置或分辨率已经变化，已停止以避免点击画布外。")
 
     def _viewport(self, w, h):
         """Return the centered 16:9 game viewport inside the Unity client."""
@@ -786,6 +684,165 @@ class AutoPainter:
             offset_x, offset_y, scale_x, scale_y = self.coordinate_calibration
             return offset_x + x * scale_x, offset_y + y * scale_y
         return self._uncalibrated_scaled(x, y, w, h)
+
+    @staticmethod
+    def _expected_canvas_bounds(w, h):
+        scale = min(w / BASE_W, h / BASE_H)
+        viewport_x = (w - BASE_W * scale) / 2.0
+        viewport_y = (h - BASE_H * scale) / 2.0
+        return (
+            viewport_x + CONFIG["grid_left"] * scale,
+            viewport_y + CONFIG["grid_top"] * scale,
+            viewport_x + CONFIG["grid_right"] * scale,
+            viewport_y + CONFIG["grid_bottom"] * scale,
+        )
+
+    @classmethod
+    def _recognize_surface_image(cls, image):
+        """Require both editor structures before accepting an input surface."""
+        w, h = image.size
+        expected = cls._expected_canvas_bounds(w, h)
+        palette = detect_palette_layout(image)
+        grid_candidates = []
+        errors = []
+        for detector in (detect_canvas_grid_dynamic, detect_canvas_grid):
+            try:
+                candidate = detector(image, expected)
+                if candidate.bounds not in {item.bounds for item in grid_candidates}:
+                    grid_candidates.append(candidate)
+            except Exception as error:
+                errors.append(str(error))
+
+        accepted = []
+        short_edge = min(w, h)
+        expected_side = ((expected[2] - expected[0]) + (expected[3] - expected[1])) / 2.0
+        for grid in grid_candidates:
+            grid_side_x = grid.x_lines[-1] - grid.x_lines[0]
+            grid_side_y = grid.y_lines[-1] - grid.y_lines[0]
+            board_ratio = ((grid_side_x + grid_side_y) / 2.0) / short_edge
+            if not 0.55 <= board_ratio <= 0.83:
+                errors.append(f"画布占屏比例异常：{board_ratio:.0%}")
+                continue
+            if grid.x_lines[-1] >= palette.bounds[0]:
+                errors.append("画布与调色板相对位置不符合编辑界面")
+                continue
+            geometry = 1.0 - abs(grid_side_x - grid_side_y) / max(grid_side_x, grid_side_y)
+            proximity = sum(abs(a - b) for a, b in zip(grid.bounds, expected)) / max(1, expected_side)
+            # The 25-line detector can have a modest contrast confidence on a
+            # completely white board, but its exact periodic fit and expected
+            # location are strong evidence.  Compare every valid candidate;
+            # never let the first successful outer-frame hypothesis win by
+            # itself.
+            score = (
+                palette.confidence * 2.0
+                + grid.confidence
+                + geometry
+                - proximity * 0.45
+            )
+            if palette.confidence >= 0.08 and grid.confidence >= 0.25:
+                accepted.append((score, grid))
+
+        if not accepted:
+            raise RuntimeError("；".join(errors[:4]) or "未识别到有效24×24画布")
+        accepted.sort(reverse=True, key=lambda item: item[0])
+        score, grid = accepted[0]
+        return grid, palette, score
+
+    def _select_visual_surface(self, host_hwnd):
+        """Choose the game surface with a cheap screen probe then one full scan."""
+        candidates = list_visual_surface_candidates(host_hwnd)
+        if not candidates:
+            raise RuntimeError("所选窗口没有可截图的客户区")
+        # Multiple emulator HWNDs often expose the exact same screen rectangle.
+        # One screenshot/recognition per physical rectangle is sufficient.
+        unique = []
+        seen_rectangles = set()
+        for candidate in candidates:
+            rectangle = (
+                candidate["origin_x"], candidate["origin_y"],
+                candidate["width"], candidate["height"],
+            )
+            if rectangle in seen_rectangles:
+                continue
+            seen_rectangles.add(rectangle)
+            unique.append(candidate)
+        # This is only an evaluation order, never an acceptance rule.  Most
+        # game render surfaces are 16:9 while emulator shells add toolbars;
+        # trying likely viewports first avoids spending a full probe on the
+        # shell.  A non-16:9 surface is still accepted when its pixels pass.
+        unique.sort(key=lambda item: (
+            abs(item["width"] / item["height"] - BASE_W / BASE_H),
+            -item["overlap"],
+        ))
+
+        accepted = []
+        errors = []
+        for candidate in unique:
+            try:
+                ox, oy = candidate["origin_x"], candidate["origin_y"]
+                w, h = candidate["width"], candidate["height"]
+                image = ImageGrab.grab(
+                    bbox=(ox, oy, ox + w, oy + h), all_screens=True,
+                ).convert("RGB")
+                # Cap the long edge during candidate screening.  Recognition
+                # cost otherwise grows sharply at 2K/4K and repeated emulator
+                # surfaces waste seconds.  Coordinates are refined once at
+                # native resolution for the best probe only.
+                # 1280 keeps a 24x24 cell pitch large enough for unambiguous
+                # outer-frame detection, while still capping 2K/4K scan cost.
+                probe_scale = min(1.0, 1280 / max(w, h))
+                probe = image if probe_scale == 1.0 else image.resize(
+                    (round(w * probe_scale), round(h * probe_scale)),
+                    # Palette recognition compares actual game swatch colours;
+                    # nearest-neighbour keeps them exact during the probe.
+                    Image.Resampling.NEAREST,
+                )
+                grid, palette, vision_score = self._recognize_surface_image(probe)
+                scale_x = w / probe.width
+                scale_y = h / probe.height
+                native_grid = GridLayout(
+                    tuple(value * scale_x for value in grid.x_lines),
+                    tuple(value * scale_y for value in grid.y_lines),
+                    grid.confidence,
+                )
+                native_palette = PaletteLayout(
+                    tuple(value * scale_x for value in palette.columns),
+                    tuple(value * scale_y for value in palette.rows),
+                    palette.first_global_row,
+                    palette.confidence,
+                )
+                accepted.append((
+                    vision_score + candidate["overlap"] * 0.05,
+                    w * h, candidate, native_grid, native_palette,
+                ))
+                # Both structures are already near-certain.  Candidate order
+                # prefers the selected client and largest overlapping surfaces,
+                # so another full screenshot cannot materially improve safety.
+                if grid.confidence >= 0.94 and palette.confidence >= 0.80:
+                    break
+            except Exception as error:
+                errors.append(f"{candidate['width']}×{candidate['height']}: {error}")
+        if not accepted:
+            detail = "；".join(errors[:3])
+            raise RuntimeError(
+                "未在所选窗口的候选画面中同时识别到24×24画布和4列调色板"
+                + (f"（{detail}）" if detail else "")
+            )
+        accepted.sort(reverse=True, key=lambda item: (item[0], item[1]))
+        _score, _area, selected, grid, palette = accepted[0]
+        return selected, grid, palette
+
+    @staticmethod
+    def _optimize_cell_order(points):
+        """Serpentine scan minimizes visible long jumps for one colour."""
+        rows = {}
+        for x, y in points:
+            rows.setdefault(y, []).append(x)
+        ordered = []
+        for y in sorted(rows):
+            xs = sorted(rows[y], reverse=bool(y % 2))
+            ordered.extend((x, y) for x in xs)
+        return ordered
 
     @staticmethod
     def _detect_grid_axis(gray, expected_bounds, vertical):
@@ -894,10 +951,16 @@ class AutoPainter:
         screenshot = ImageGrab.grab(
             bbox=(origin_x, origin_y, origin_x + w, origin_y + h),
             all_screens=True,
-        ).convert("L")
+        ).convert("RGB")
         expected = (expected_left, expected_top, expected_right, expected_bottom)
-        x_lines = self._detect_grid_axis(screenshot, expected, vertical=True)
-        y_lines = self._detect_grid_axis(screenshot, expected, vertical=False)
+        try:
+            # The long outer frame is authoritative and prevents a periodic
+            # 24-line fit from shifting the whole canvas by one emulator row.
+            layout = detect_canvas_grid_dynamic(screenshot, expected)
+        except RuntimeError:
+            layout = detect_canvas_grid(screenshot, expected)
+        x_lines = list(layout.x_lines)
+        y_lines = list(layout.y_lines)
 
         scale_x = (x_lines[-1] - x_lines[0]) / (CONFIG["grid_right"] - CONFIG["grid_left"])
         scale_y = (y_lines[-1] - y_lines[0]) / (CONFIG["grid_bottom"] - CONFIG["grid_top"])
@@ -906,7 +969,19 @@ class AutoPainter:
         self.coordinate_calibration = (offset_x, offset_y, scale_x, scale_y)
         self.grid_x_lines = x_lines
         self.grid_y_lines = y_lines
+        try:
+            self.palette_layout = detect_palette_layout(screenshot)
+        except Exception:
+            self.palette_layout = None
         return x_lines, y_lines
+
+    def _refresh_palette_layout(self, origin_x, origin_y, w, h):
+        screenshot = ImageGrab.grab(
+            bbox=(origin_x, origin_y, origin_x + w, origin_y + h),
+            all_screens=True,
+        ).convert("RGB")
+        self.palette_layout = detect_palette_layout(screenshot)
+        return self.palette_layout
 
     def _grid_center(self, col, row, w, h):
         if self.grid_x_lines is not None and self.grid_y_lines is not None:
@@ -921,8 +996,13 @@ class AutoPainter:
         return gl + (col + 0.5) * cw, gt + (row + 0.5) * ch
 
     def _scroll_palette(self, origin_x, origin_y, w, h, to_bottom):
-        ax, ay = CONFIG["palette_scroll_anchor"]
-        ax, ay = self._scaled(ax, ay, w, h)
+        self._ensure_surface_stable()
+        if self.palette_layout is not None:
+            left, top, right, bottom = self.palette_layout.bounds
+            ax, ay = (left + right) / 2, (top + bottom) / 2
+        else:
+            ax, ay = CONFIG["palette_scroll_anchor"]
+            ax, ay = self._scaled(ax, ay, w, h)
         game_mouse.move_to(origin_x + ax, origin_y + ay, duration=0.08)
 
         # Unity 可能把一个 mouseData=35*WHEEL_DELTA 的大事件只当成一次滚动。
@@ -939,9 +1019,52 @@ class AutoPainter:
             game_mouse.scroll(direction)
             time.sleep(0.025)
         time.sleep(0.35)
+        try:
+            layout = self._refresh_palette_layout(origin_x, origin_y, w, h)
+        except Exception:
+            # Retain the previous dynamic layout or fixed-coordinate fallback.
+            layout = None
+
+        expected_first = CONFIG["palette_bottom_first_global_row"] if to_bottom else 0
+        if layout is not None and layout.first_global_row != expected_first:
+            # Some Unity/emulator builds ignore synthetic wheel messages but
+            # accept a physical drag of the white scrollbar handle.  Its two
+            # endpoints are derived from the detected swatch pitch, not fixed
+            # 1280x720 coordinates.
+            pitch = median(b - a for a, b in zip(layout.rows, layout.rows[1:]))
+            center_x = (layout.columns[0] + layout.columns[-1]) / 2
+            track_top = max(8, layout.rows[0] - pitch * 1.75)
+            track_bottom = min(h - 8, layout.rows[-1] + pitch * 1.05)
+            # The game's decorative scrollbar is inverted: the white marker
+            # sits at the bottom for palette rows 1..6 and at the top for
+            # rows 5..10.
+            start_y, end_y = ((track_bottom, track_top) if to_bottom
+                              else (track_top, track_bottom))
+            game_mouse.move_to(origin_x + center_x, origin_y + start_y, duration=0.08)
+            game_mouse.drag_to(origin_x + center_x, origin_y + end_y, duration=0.55)
+            time.sleep(0.45)
+            layout = self._refresh_palette_layout(origin_x, origin_y, w, h)
+
+        if layout is not None and layout.first_global_row != expected_first:
+            raise RuntimeError(
+                f"调色板未滚动到{'底部' if to_bottom else '顶部'}："
+                f"识别到起始行为 {layout.first_global_row + 1}。"
+                "请确认游戏已获得焦点且本工具以管理员身份运行。"
+            )
 
     def _palette_click_pos(self, color_index, origin_x, origin_y, w, h, bottom_mode):
         row, col = divmod(color_index, 4)
+
+        if self.palette_layout is not None:
+            visible_row = row - self.palette_layout.first_global_row
+            if not (0 <= visible_row < len(self.palette_layout.rows)):
+                raise RuntimeError(
+                    f"色号 {color_index + 1} 不在当前动态识别的调色板行中"
+                )
+            return (
+                origin_x + self.palette_layout.columns[col],
+                origin_y + self.palette_layout.rows[visible_row],
+            )
 
         if bottom_mode:
             first = CONFIG["palette_bottom_first_global_row"]
@@ -957,16 +1080,32 @@ class AutoPainter:
         px, py = self._scaled(CONFIG["palette_cols"][col], visible_rows[visible_row], w, h)
         return origin_x + px, origin_y + py
 
-    def paint(self, matrix, keyword, click_delay, skip_white):
+    def paint(self, matrix, window_target, click_delay, skip_white):
+        if not self.paint_lock.acquire(blocking=False):
+            self.app.thread_status("已有自动填充任务正在运行，请先停止并等待结束。", error=True)
+            return
+        try:
+            self._paint_locked(matrix, window_target, click_delay, skip_white)
+        finally:
+            self.active_surface = None
+            game_mouse.release_cursor()
+            game_mouse.set_target(None)
+            self.paint_lock.release()
+
+    def _paint_locked(self, matrix, window_target, click_delay, skip_white):
         self.stop_event.clear()
         game_mouse.set_target(None)
+        self.coordinate_calibration = None
+        self.grid_x_lines = None
+        self.grid_y_lines = None
+        self.palette_layout = None
 
         # 客户端在前后台切换时会销毁/重建 Unity 窗口；隐藏的 Arknights Qt
         # 宿主窗口句柄则保持不变。激活宿主后重新查找，直到拿到稳定渲染窗口。
-        hwnd = title = None
+        host_hwnd = hwnd = title = None
         ox = oy = w = h = 0
         for _ in range(5):
-            candidate, candidate_title = find_game_window(keyword)
+            candidate, candidate_title = resolve_selected_window(window_target)
             if not candidate:
                 time.sleep(0.2)
                 continue
@@ -975,7 +1114,7 @@ class AutoPainter:
                 continue
             time.sleep(0.45)
 
-            refreshed, refreshed_title = find_game_window(keyword)
+            refreshed, refreshed_title = resolve_selected_window(window_target)
             if refreshed and refreshed != candidate:
                 candidate, candidate_title = refreshed, refreshed_title
                 focus_window(candidate)
@@ -986,16 +1125,32 @@ class AutoPainter:
             except Exception:
                 time.sleep(0.2)
                 continue
-            hwnd, title = candidate, candidate_title
+            host_hwnd, title = candidate, candidate_title
             if w >= 800 and h >= 450:
                 break
 
-        if not hwnd:
-            self.app.thread_status("未找到游戏窗口。请确认游戏已打开，并检查窗口标题关键字。", error=True)
+        if not host_hwnd:
+            self.app.thread_status("所选游戏窗口已失效，请返回工具刷新并重新选择窗口。", error=True)
             return
 
         if w < 800 or h < 450:
             self.app.thread_status(f"游戏客户区尺寸异常：{w}x{h}", error=True)
+            return
+
+        # Select the true game surface from visual evidence.  This supports
+        # direct PC clients plus emulator shells, child render controls and
+        # separate top-level render surfaces without emulator-specific rules.
+        try:
+            surface, visual_grid, visual_palette = self._select_visual_surface(host_hwnd)
+            hwnd = surface["hwnd"]
+            ox, oy = surface["origin_x"], surface["origin_y"]
+            w, h = surface["width"], surface["height"]
+            self.grid_x_lines = list(visual_grid.x_lines)
+            self.grid_y_lines = list(visual_grid.y_lines)
+            self.palette_layout = visual_palette
+            self.active_surface = (hwnd, ox, oy, w, h)
+        except Exception as surface_error:
+            self.app.thread_status(f"游戏编辑界面自动定位失败：{surface_error}", error=True)
             return
 
         # 允许按比例缩放，但对 1280x720 最准确
@@ -1011,22 +1166,13 @@ class AutoPainter:
         # Calibrate from the pixels currently rendered by the game.  This is
         # more reliable than trusting a nominal 1280x720 setting on mixed-DPI
         # systems, where the Win32 client rectangle can use a different scale.
-        calibration_summary = "比例坐标"
-        try:
-            x_lines, y_lines = self._calibrate_coordinates(ox, oy, w, h)
-            detected_w = x_lines[-1] - x_lines[0]
-            detected_h = y_lines[-1] - y_lines[0]
-            calibration_summary = f"自动校准 {detected_w}×{detected_h}px"
-            self.app.thread_status(
-                f"已自动校准 24×24 网格：{detected_w}×{detected_h} px，客户区 {w}×{h}"
-            )
-        except Exception as calibration_error:
-            self.coordinate_calibration = None
-            self.grid_x_lines = None
-            self.grid_y_lines = None
-            self.app.thread_status(
-                f"自动网格校准未通过，改用比例坐标：{calibration_error}"
-            )
+        detected_w = self.grid_x_lines[-1] - self.grid_x_lines[0]
+        detected_h = self.grid_y_lines[-1] - self.grid_y_lines[0]
+        calibration_summary = f"视觉校准 {detected_w:.0f}×{detected_h:.0f}px"
+        self.app.thread_status(
+            f"已从候选画面动态定位编辑界面：画布 {detected_w:.0f}×{detected_h:.0f}px；"
+            f"调色板置信度 {self.palette_layout.confidence:.0%}；输入客户区 {w}×{h}"
+        )
 
         # 按颜色分组，减少切换色板次数
         groups = {i: [] for i in range(len(PALETTE))}
@@ -1037,8 +1183,20 @@ class AutoPainter:
                     continue
                 groups[idx].append((x, y))
 
+        for color_index in groups:
+            groups[color_index] = self._optimize_cell_order(groups[color_index])
+
         used_colors = [i for i, pts in groups.items() if pts]
         total_cells = sum(len(groups[i]) for i in used_colors)
+
+        # Only lock the cursor for the actual input phase.  From this point on
+        # every exit path is covered by the finally block below.
+        try:
+            game_mouse.clip_to_target()
+        except Exception as cursor_error:
+            game_mouse.set_target(None)
+            self.app.thread_status(f"无法启用游戏窗口鼠标保护：{cursor_error}", error=True)
+            return
 
         try:
             done = 0
@@ -1054,6 +1212,7 @@ class AutoPainter:
                     continue
 
                 px, py = self._palette_click_pos(color_idx, ox, oy, w, h, bottom_mode=False)
+                self._ensure_surface_stable()
                 game_mouse.click(px, py)
                 time.sleep(max(0.08, click_delay))
 
@@ -1062,6 +1221,7 @@ class AutoPainter:
                         self.app.thread_status("已停止。")
                         return
                     gx, gy = self._grid_center(x, y, w, h)
+                    self._ensure_surface_stable()
                     game_mouse.click(ox + gx, oy + gy)
                     done += 1
                     self.app.thread_progress(done, total_cells, color_idx)
@@ -1080,6 +1240,7 @@ class AutoPainter:
                     continue
 
                 px, py = self._palette_click_pos(color_idx, ox, oy, w, h, bottom_mode=True)
+                self._ensure_surface_stable()
                 game_mouse.click(px, py)
                 time.sleep(max(0.08, click_delay))
 
@@ -1088,6 +1249,7 @@ class AutoPainter:
                         self.app.thread_status("已停止。")
                         return
                     gx, gy = self._grid_center(x, y, w, h)
+                    self._ensure_surface_stable()
                     game_mouse.click(ox + gx, oy + gy)
                     done += 1
                     self.app.thread_progress(done, total_cells, color_idx)
@@ -1417,12 +1579,12 @@ class ScreenCaptureDialog(tk.Toplevel):
 # ---------------------------- GUI ----------------------------
 class App(tk.Tk):
     BASE_PREVIEW_SIZE = 408
-    MIN_PREVIEW_SIZE = 240
+    MIN_PREVIEW_SIZE = 168
     COLOR_GUIDE_MARGIN = 28
     BASE_WINDOW_W = 1180
     BASE_WINDOW_H = 760
-    MIN_WINDOW_W = 920
-    MIN_WINDOW_H = 660
+    MIN_WINDOW_W = 820
+    MIN_WINDOW_H = 600
     BG = "#17384d"
     BODY_BG = "#285f7d"
     HERO_BG = "#2f7fa7"
@@ -1480,12 +1642,14 @@ class App(tk.Tk):
         self.mini_preview_photo = None
         self.painter = AutoPainter(self)
 
-        self.window_keyword = tk.StringVar(value="明日方舟")
+        self.window_choice = tk.StringVar(value="请点击刷新并选择游戏窗口")
+        self.window_choices = {}
         self.fit_mode = tk.StringVar(value="crop")
         self.resample_mode = tk.StringVar(value="Lanczos（原版）")
         self.color_match_mode = tk.StringVar(value="经典RGB（原版）")
         self.resample_strength = tk.DoubleVar(value=100.0)
         self.match_strength = tk.DoubleVar(value=100.0)
+        self.structure_strength = tk.DoubleVar(value=0.0)
         self.dither = tk.BooleanVar(value=False)
         self.reduce_transitions = tk.BooleanVar(value=False)
         self.click_delay = tk.DoubleVar(value=0.060)
@@ -1495,14 +1659,15 @@ class App(tk.Tk):
         self.file_var = tk.StringVar(value="尚未选择图片")
         self.palette_info_var = tk.StringVar(value="40 色游戏调色板")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self._tracer_logo_source = None
         self.tracer_logo_photo = self._load_tracer_logo()
-        self.visual_assets = self._load_visual_assets()
         self.selected_color_var = tk.StringVar(value="")
         self._drag_offset = (0, 0)
         self._native_hwnd = None
         self._responsive_after = None
         self._reprocess_after = None
         self._compact_layout = None
+        self._layout_signature = None
         self._latest_release = None
 
         self._build_ui()
@@ -1513,6 +1678,7 @@ class App(tk.Tk):
         self.update_idletasks()
         self._apply_native_window_geometry()
         self.after(80, self._configure_taskbar_window)
+        self.after(180, self.refresh_window_list)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Map>", self._restore_borderless)
         self.bind("<Configure>", self._on_window_configure)
@@ -1542,15 +1708,9 @@ class App(tk.Tk):
 
     @classmethod
     def _ui_scale_for(cls, work_w, work_h, dpi=96):
-        dpi_scale = max(0.75, min(2.5, dpi / 96.0))
-        resolution_scale = min(work_w / 1920.0, work_h / 1040.0)
-        desired_scale = max(dpi_scale, min(2.0, max(0.85, resolution_scale)))
-        fit_scale = min(
-            desired_scale,
-            max(0.72, (work_w - 24) / cls.BASE_WINDOW_W),
-            max(0.72, (work_h - 24) / cls.BASE_WINDOW_H),
+        return calculate_ui_scale(
+            work_w, work_h, dpi, base_size=(cls.BASE_WINDOW_W, cls.BASE_WINDOW_H)
         )
-        return fit_scale
 
     def _outer_hwnd(self):
         hwnd = int(self.winfo_id())
@@ -1652,6 +1812,10 @@ class App(tk.Tk):
                         indicatorcolor=self.CARD_ALT, padding=(0, 4))
         style.map("Card.TCheckbutton", background=[("active", self.CARD)],
                   indicatorcolor=[("selected", self.ACCENT)])
+        style.configure("CardAlt.TCheckbutton", background=self.CARD_ALT, foreground=self.TEXT,
+                        indicatorcolor=self.CARD, padding=(0, 2))
+        style.map("CardAlt.TCheckbutton", background=[("active", self.CARD_ALT)],
+                  indicatorcolor=[("selected", self.ACCENT)])
         style.configure("Dark.TEntry", fieldbackground="#0e171f", foreground=self.TEXT,
                         insertcolor=self.TEXT, bordercolor=self.BORDER, padding=7)
         style.configure("Dark.TCombobox", fieldbackground="#0e171f", background=self.CARD_ALT,
@@ -1677,7 +1841,7 @@ class App(tk.Tk):
         titlebar.pack_propagate(False)
         title_icon = tk.Label(titlebar, image=self._window_icon, bg="#101d28")
         title_icon.pack(side="left", padx=(10, 7))
-        title_text = tk.Label(titlebar, text="ARKNIGHTS  /  24×24 PIXEL LAB",
+        title_text = tk.Label(titlebar, text=f"ARKNIGHTS  /  24×24 PIXEL LAB  v{APP_VERSION}",
                               bg="#101d28", fg="#d9eef5",
                               font=("Segoe UI", 9, "bold"))
         title_text.pack(side="left")
@@ -1700,25 +1864,32 @@ class App(tk.Tk):
             widget.bind("<B1-Motion>", self._drag_window)
             widget.bind("<Double-Button-1>", lambda _event: self._toggle_maximize())
 
-        # 旅行主题 Hero，使用 Angelina 素材
+        # 简洁标题区；不再叠加旅行主题图案，避免干扰产品标题。
         hero = tk.Canvas(root, height=self._u(90), bg=self.HERO_BG, highlightthickness=0)
         self.hero_canvas = hero
         hero.pack(fill="x")
-        hero.create_rectangle(0, self._u(64), self.WINDOW_W, self._u(90), fill="#286d91", outline="")
-        hero.create_text(self._u(24), self._u(18), text="ARKNIGHTS  /  PIXEL STUDIO", anchor="w",
-                         fill="#d9f5ff", font=("Segoe UI", 9, "bold"))
-        hero.create_text(self._u(24), self._u(49), text="24×24 像素画工坊", anchor="w",
-                         fill="white", font=("Microsoft YaHei UI", 21, "bold"))
-        hero.create_text(self._u(380), self._u(52), text="上传 · 量化 · 手动修整 · 自动绘制", anchor="w",
-                         fill="#cde9f4", font=("Microsoft YaHei UI", 10))
-        if self.visual_assets.get("stars"):
-            hero.create_image(self._u(700), self._u(44), image=self.visual_assets["stars"])
-        if self.visual_assets.get("orange_title"):
-            hero.create_image(self._u(812), self._u(45), image=self.visual_assets["orange_title"])
+        self.hero_band_item = hero.create_rectangle(
+            0, self._u(64), self.WINDOW_W, self._u(90), fill="#286d91", outline=""
+        )
+        self.hero_kicker_item = hero.create_text(
+            self._u(24), self._u(18), text="ARKNIGHTS  /  PIXEL STUDIO", anchor="w",
+            fill="#d9f5ff", font=("Segoe UI", 9, "bold")
+        )
+        self.hero_title_item = hero.create_text(
+            self._u(24), self._u(49), text="24×24 像素画工坊", anchor="w",
+            fill="white", font=("Microsoft YaHei UI", 21, "bold")
+        )
+        self.hero_subtitle_item = hero.create_text(
+            self._u(380), self._u(52), text="上传 · 量化 · 手动修整 · 自动绘制", anchor="w",
+            fill="#cde9f4", font=("Microsoft YaHei UI", 10)
+        )
+        self.hero_logo_item = None
         if self.tracer_logo_photo is not None:
-            hero.create_image(self._u(980), self._u(45), image=self.tracer_logo_photo)
-        if self.visual_assets.get("paperplane"):
-            hero.create_image(self._u(1110), self._u(55), image=self.visual_assets["paperplane"])
+            self.hero_logo_item = hero.create_image(
+                max(self._u(140), hero.winfo_width() - self._u(24)),
+                self._u(45), image=self.tracer_logo_photo, anchor="e"
+            )
+        hero.bind("<Configure>", self._on_hero_configure)
 
         # 底部固定免责声明，避免窗口缩放时被主体区域挤出
         legal = tk.Frame(root, bg="#102431", height=self._u(48))
@@ -1742,48 +1913,38 @@ class App(tk.Tk):
         )
 
         body = tk.Frame(root, bg=self.BODY_BG, padx=self._u(14), pady=self._u(10))
+        self.body = body
         body.pack(fill="both", expand=True)
 
         left_shell = ttk.Frame(body, style="Card.TFrame", width=self._u(270))
+        self.left_shell = left_shell
         left_shell.pack(side="left", fill="y")
         left_shell.pack_propagate(False)
-        left_canvas = tk.Canvas(
-            left_shell,
-            bg=self.CARD,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        # The sidebar follows the window density instead of permanently showing
-        # a scrollbar.  Mouse-wheel scrolling remains as a last-resort fallback
-        # for unusually large accessibility fonts.
-        left_canvas.pack(fill="both", expand=True)
-        left = ttk.Frame(left_canvas, style="Card.TFrame", padding=self._u(13))
-        left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
-        left.bind(
-            "<Configure>",
-            lambda _event: left_canvas.configure(scrollregion=left_canvas.bbox("all")),
-        )
-        left_canvas.bind(
-            "<Configure>",
-            lambda event: left_canvas.itemconfigure(left_window, width=event.width),
-        )
 
-        def scroll_left_panel(event):
-            steps = -1 if event.delta > 0 else 1
-            left_canvas.yview_scroll(steps, "units")
-
-        left_shell.bind("<Enter>", lambda _event: self.bind_all("<MouseWheel>", scroll_left_panel))
-        left_shell.bind("<Leave>", lambda _event: self.unbind_all("<MouseWheel>"))
-        self.left_scroll_canvas = left_canvas
+        # One fixed responsive column: controls and actions share the same
+        # proportional scale, so enlarging the window never creates a large
+        # artificial gap between click delay and the start button.
+        left = ttk.Frame(left_shell, style="Card.TFrame", padding=self._u(10))
+        left.pack(fill="both", expand=True)
         self.left_content = left
 
         ttk.Label(left, text="01  图片处理", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(left, textvariable=self.file_var, style="Muted.TLabel").pack(
-            anchor="w", fill="x", pady=(2, 6))
+        self.file_label = ttk.Label(left, textvariable=self.file_var, style="Muted.TLabel")
+        self.file_label.pack(anchor="w", fill="x", pady=(2, 6))
         image_buttons = ttk.Frame(left, style="Card.TFrame")
-        image_buttons.pack(fill="x", pady=(0, 7))
+        self.image_buttons = image_buttons
+        image_buttons.pack(fill="x", pady=(0, 4))
+        image_buttons.columnconfigure(0, weight=1, uniform="image-actions")
+        image_buttons.columnconfigure(1, minsize=self._u(6))
+        image_buttons.columnconfigure(2, weight=1, uniform="image-actions")
+        def equalize_image_actions(event):
+            gap = self._u(6)
+            width = max(1, (event.width - gap) // 2)
+            image_buttons.columnconfigure(0, weight=0, minsize=width)
+            image_buttons.columnconfigure(2, weight=0, minsize=width)
+        image_buttons.bind("<Configure>", equalize_image_actions)
         ttk.Button(image_buttons, text="＋  选择图片", style="Secondary.TButton",
-                   command=self.open_image).pack(side="left", fill="x", expand=True)
+                   command=self.open_image).grid(row=0, column=0, sticky="ew")
         self.crop_button = ttk.Button(
             image_buttons,
             text="✂  裁切",
@@ -1791,33 +1952,37 @@ class App(tk.Tk):
             command=self.open_crop_editor,
             state="disabled",
         )
-        self.crop_button.pack(side="left", padx=(self._u(6), 0))
+        self.crop_button.grid(row=0, column=2, sticky="ew")
 
         import_tools = ttk.Frame(left, style="Card.TFrame")
-        import_tools.pack(fill="x", pady=(0, 7))
+        import_tools.pack(fill="x", pady=(0, 4))
         self.bitmap_button = ttk.Button(
             import_tools,
             text="▦  24×24位图",
             style="Secondary.TButton",
             command=self.open_24_bitmap,
         )
-        self.bitmap_button.pack(side="left", fill="x", expand=True)
+        import_tools.columnconfigure(0, weight=1, uniform="import-actions")
+        import_tools.columnconfigure(1, weight=1, uniform="import-actions")
+        import_tools.columnconfigure(2, weight=1, uniform="import-actions")
+        self.bitmap_button.grid(row=0, column=0, sticky="ew")
         self.share_button = ttk.Button(
             import_tools,
             text="▦  官方分享",
             style="Secondary.TButton",
             command=self.open_official_share,
         )
-        self.share_button.pack(side="left", fill="x", expand=True, padx=(self._u(4), 0))
+        self.share_button.grid(row=0, column=1, sticky="ew", padx=(self._u(4), 0))
         self.capture_button = ttk.Button(
             import_tools,
-            text="截图",
+            text="▣  截图导入",
             style="Secondary.TButton",
             command=self.capture_screen,
         )
-        self.capture_button.pack(side="left", fill="x", expand=True, padx=(self._u(4), 0))
+        self.capture_button.grid(row=0, column=2, sticky="ew", padx=(self._u(4), 0))
 
-        ttk.Label(left, text="缩放方式", style="Muted.TLabel").pack(anchor="w")
+        self.fit_mode_label = ttk.Label(left, text="缩放方式", style="Muted.TLabel")
+        self.fit_mode_label.pack(anchor="w")
         self.mode_box = ttk.Combobox(
             left,
             textvariable=self.fit_mode,
@@ -1828,7 +1993,8 @@ class App(tk.Tk):
         self.mode_box.pack(fill="x", pady=(2, 3))
         self.mode_box.bind("<<ComboboxSelected>>", lambda e: self.reprocess())
 
-        ttk.Label(left, text="缩放取样算法", style="Muted.TLabel").pack(anchor="w")
+        self.resample_mode_label = ttk.Label(left, text="缩放取样算法", style="Muted.TLabel")
+        self.resample_mode_label.pack(anchor="w")
         self.resample_box = ttk.Combobox(
             left,
             textvariable=self.resample_mode,
@@ -1857,7 +2023,8 @@ class App(tk.Tk):
         )
         self.resample_scale.pack(side="left", fill="x", expand=True, padx=(self._u(5), self._u(5)))
 
-        ttk.Label(left, text="颜色匹配算法", style="Muted.TLabel").pack(anchor="w")
+        self.match_mode_label = ttk.Label(left, text="颜色匹配算法", style="Muted.TLabel")
+        self.match_mode_label.pack(anchor="w")
         self.match_box = ttk.Combobox(
             left,
             textvariable=self.color_match_mode,
@@ -1904,11 +2071,55 @@ class App(tk.Tk):
         )
         self.transition_check.pack(anchor="w")
 
-        ttk.Separator(left, style="Dark.TSeparator").pack(fill="x", pady=9)
+        structure_line = ttk.Frame(left, style="Card.TFrame")
+        structure_line.pack(fill="x", pady=(3, 1))
+        ttk.Label(structure_line, text="结构增强 / 去阴影", style="Muted.TLabel").pack(side="left")
+        self.structure_strength_label = ttk.Label(
+            structure_line, text="0%", style="Badge.TLabel"
+        )
+        self.structure_strength_label.pack(side="right")
+        self.structure_scale = ttk.Scale(
+            structure_line,
+            from_=0,
+            to=100,
+            variable=self.structure_strength,
+            command=lambda _value: self._on_algorithm_slider(),
+            orient="horizontal",
+            style="Dark.Horizontal.TScale",
+        )
+        self.structure_scale.pack(
+            side="left", fill="x", expand=True, padx=(self._u(5), self._u(5))
+        )
 
-        ttk.Label(left, text="02  自动化设置", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(left, text="游戏窗口标题关键字", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
-        ttk.Entry(left, textvariable=self.window_keyword, style="Dark.TEntry").pack(fill="x", pady=(2, 6))
+        ttk.Separator(left, style="Dark.TSeparator").pack(fill="x", pady=5)
+
+        automation_header = ttk.Frame(left, style="Card.TFrame")
+        automation_header.pack(fill="x")
+        ttk.Label(
+            automation_header, text="02  自动化设置", style="Section.TLabel"
+        ).pack(side="left")
+        self.window_picker_label = ttk.Label(
+            automation_header,
+            text="选择游戏窗口",
+            style="Muted.TLabel",
+        )
+        self.window_picker_label.pack(side="right")
+        window_line = ttk.Frame(left, style="Card.TFrame")
+        window_line.pack(fill="x", pady=(4, 6))
+        self.window_box = ttk.Combobox(
+            window_line,
+            textvariable=self.window_choice,
+            state="readonly",
+            style="Dark.TCombobox",
+        )
+        self.window_box.pack(side="left", fill="x", expand=True)
+        self.window_box.bind("<<ComboboxSelected>>", self._on_window_selected)
+        ttk.Button(
+            window_line,
+            text="刷新",
+            command=self.refresh_window_list,
+            style="Compact.TButton",
+        ).pack(side="left", padx=(self._u(5), 0))
 
         speed_line = ttk.Frame(left, style="Card.TFrame")
         speed_line.pack(fill="x")
@@ -1921,46 +2132,68 @@ class App(tk.Tk):
         self.click_delay.trace_add("write", lambda *_: self._update_delay_label())
         self._update_delay_label()
 
-        ttk.Checkbutton(
-            left,
-            text="跳过白色格（仅空白画布建议）",
+        left_action_bar = ttk.Frame(left, style="CardAlt.TFrame", padding=self._u(6))
+        self.left_action_bar = left_action_bar
+        left_action_bar.pack(fill="x", pady=(self._u(6), 0))
+        self.skip_white_check = ttk.Checkbutton(
+            left_action_bar,
+            text="跳过白色格",
             variable=self.skip_white,
-            style="Card.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 7))
-
-        action_buttons = ttk.Frame(left, style="Card.TFrame")
-        action_buttons.pack(fill="x")
-        self.start_button = ttk.Button(action_buttons, text="▶  开始自动填充", style="Primary.TButton",
-                                       command=self.start_paint)
-        self.start_button.pack(side="left", fill="x", expand=True)
-        ttk.Button(action_buttons, text="■  停止", style="Danger.TButton",
-                   command=self.stop_paint).pack(side="left", padx=(self._u(5), 0))
-
-        self.sidebar_footer_hint = ttk.Label(
-            left,
-            text="建议 1280×720  ·  紧急停止 F8",
-            style="Muted.TLabel",
+            style="CardAlt.TCheckbutton",
         )
-        self.sidebar_footer_hint.pack(anchor="center", pady=(7, 0))
+        self.skip_white_check.pack(anchor="w", pady=(0, self._u(5)))
+        action_button_row = ttk.Frame(left_action_bar, style="CardAlt.TFrame")
+        self.action_button_row = action_button_row
+        action_button_row.pack(fill="x")
+        self.start_button = ttk.Button(
+            action_button_row,
+            text="▶  开始自动填充",
+            style="Primary.TButton",
+            command=self.start_paint,
+        )
+        self.start_button.pack(side="left", fill="x", expand=True)
+        self.stop_button = ttk.Button(
+            action_button_row, text="■  停止", style="Danger.TButton", command=self.stop_paint
+        )
+        self.stop_button.pack(side="left", padx=(self._u(5), 0))
 
         palette_panel = ttk.Frame(body, style="Card.TFrame", padding=self._u(12), width=self._u(214))
+        self.palette_panel = palette_panel
         palette_panel.pack(side="right", fill="y")
         palette_panel.pack_propagate(False)
-        ttk.Label(palette_panel, text="游戏调色板", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(palette_panel, text="40 COLORS · 点击选择", style="Muted.TLabel").pack(
+        palette_header = ttk.Frame(palette_panel, style="Card.TFrame")
+        self.palette_header = palette_header
+        palette_header.pack(side="top", fill="x")
+        ttk.Label(palette_header, text="游戏调色板", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(palette_header, text="40 COLORS · 点击选择", style="Muted.TLabel").pack(
             anchor="w", pady=(1, 7))
+
+        # Keep colour identity and usage help in a fixed footer; the swatch
+        # canvas alone consumes the flexible middle height.
+        palette_footer = ttk.Frame(palette_panel, style="Card.TFrame")
+        self.palette_footer = palette_footer
+        palette_footer.pack(side="bottom", fill="x")
+        color_info = ttk.Frame(palette_footer, style="CardAlt.TFrame", padding=(8, 5))
+        self.palette_color_info = color_info
+        color_info.pack(fill="x", pady=(5, 0))
+        self.current_color_caption = ttk.Label(color_info, text="当前颜色", style="Hint.TLabel")
+        self.current_color_caption.pack(anchor="w")
+        self.selected_color_label = ttk.Label(
+            color_info, textvariable=self.selected_color_var, style="Badge.TLabel"
+        )
+        self.selected_color_label.pack(
+            anchor="w", pady=(3, 0))
+        self.palette_usage_hint = ttk.Label(
+            palette_footer, text="左键/拖动涂色 · 右键吸色", style="Muted.TLabel"
+        )
+        self.palette_usage_hint.pack(
+            anchor="center", pady=(7, 0))
+
         self.palette_canvas = tk.Canvas(palette_panel, width=self._u(176), height=self._u(370),
                                         bg=self.CARD, highlightthickness=0, cursor="hand2")
-        self.palette_canvas.pack(anchor="center", fill="both", expand=True)
+        self.palette_canvas.pack(side="top", anchor="center", fill="both", expand=True)
         self.palette_canvas.bind("<Button-1>", self._palette_click)
         self.palette_canvas.bind("<Configure>", lambda _event: self._draw_palette())
-        color_info = ttk.Frame(palette_panel, style="CardAlt.TFrame", padding=(8, 7))
-        color_info.pack(fill="x", pady=(5, 0))
-        ttk.Label(color_info, text="当前颜色", style="Hint.TLabel").pack(anchor="w")
-        ttk.Label(color_info, textvariable=self.selected_color_var, style="Badge.TLabel").pack(
-            anchor="w", pady=(3, 0))
-        ttk.Label(palette_panel, text="左键/拖动涂色 · 右键吸色", style="Muted.TLabel").pack(
-            anchor="center", pady=(7, 0))
 
         center = ttk.Frame(body, style="Card.TFrame", padding=self._u(12))
         center.pack(side="left", fill="both", expand=True, padx=self._u(12))
@@ -2026,31 +2259,26 @@ class App(tk.Tk):
     def _load_tracer_logo(self):
         try:
             with Image.open(resource_path("assets", "tracer_logo.png")) as logo:
-                logo = logo.convert("RGBA")
-                logo.thumbnail((self._u(110), self._u(68)), Image.Resampling.LANCZOS)
-                return ImageTk.PhotoImage(logo)
+                self._tracer_logo_source = logo.convert("RGBA").copy()
+                prepared = self._tracer_logo_source.copy()
+                prepared.thumbnail((self._u(110), self._u(68)), Image.Resampling.LANCZOS)
+                return ImageTk.PhotoImage(prepared)
         except Exception:
             return None
 
-    def _load_visual_assets(self):
-        specs = {
-            "paperplane": ("angelina_paperplane.png", (self._u(130), self._u(130)), 235),
-            "stars": ("angelina_stars.png", (self._u(240), self._u(78)), 135),
-            "orange_title": ("angelina_orange_title.png", (self._u(190), self._u(60)), 235),
-        }
-        result = {}
-        for key, (name, max_size, opacity) in specs.items():
-            try:
-                with Image.open(resource_path("assets", name)) as source:
-                    image = source.convert("RGBA")
-                    image.thumbnail(max_size, Image.Resampling.LANCZOS)
-                    if opacity < 255:
-                        alpha = image.getchannel("A").point(lambda value: value * opacity // 255)
-                        image.putalpha(alpha)
-                    result[key] = ImageTk.PhotoImage(image)
-            except Exception:
-                result[key] = None
-        return result
+    def _resize_tracer_logo(self, layout_scale):
+        if self._tracer_logo_source is None or self.hero_logo_item is None:
+            return
+        prepared = self._tracer_logo_source.copy()
+        prepared.thumbnail(
+            (
+                self._u(max(78, round(110 * layout_scale))),
+                self._u(max(48, round(68 * layout_scale))),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+        self.tracer_logo_photo = ImageTk.PhotoImage(prepared)
+        self.hero_canvas.itemconfigure(self.hero_logo_item, image=self.tracer_logo_photo)
 
     # ---------------------------- 无边框窗口 ----------------------------
     def _begin_drag(self, event):
@@ -2107,7 +2335,8 @@ class App(tk.Tk):
         if center_w < 100 or center_h < 100:
             return
 
-        self._apply_layout_density(self.winfo_height() < self._u(720))
+        metrics = responsive_metrics(self.winfo_width(), self.winfo_height(), self.ui_scale)
+        self._apply_layout_density(metrics)
 
         reserved_h = (
             self.preview_head.winfo_height()
@@ -2121,65 +2350,132 @@ class App(tk.Tk):
         target = max(self._u(self.MIN_PREVIEW_SIZE), target)
         # An exact multiple of 24 keeps cell boundaries and pointer hit-testing
         # identical at every window size.
-        target = max(N * 8, (int(target) // N) * N)
+        target = max(N * 6, (int(target) // N) * N)
         if target != self.PREVIEW_SIZE:
             self.PREVIEW_SIZE = target
             self.canvas.configure(width=target, height=target)
             self._render_preview()
         self._draw_palette()
 
-    def _apply_layout_density(self, compact):
-        """Keep every column visually in sync when the window becomes short."""
-        compact = bool(compact)
-        if compact == self._compact_layout:
+    def _apply_layout_density(self, metrics):
+        """Resize fonts, buttons and side columns as one responsive system."""
+        signature = (metrics.density, metrics.layout_scale)
+        if signature == self._layout_signature:
             return
-        self._compact_layout = compact
+        self._layout_signature = signature
+        self._compact_layout = metrics.density
         style = self.ui_style
-        if compact:
-            style.configure(".", font=("Microsoft YaHei UI", 9))
-            style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
-            style.configure("Muted.TLabel", font=("Microsoft YaHei UI", 8))
-            style.configure("Secondary.TButton", padding=(8, 5))
-            style.configure("Primary.TButton", padding=(10, 6))
-            style.configure("Danger.TButton", padding=(8, 5))
-            style.configure("Compact.TButton", padding=(6, 4), font=("Microsoft YaHei UI", 8))
-            style.configure("Card.TCheckbutton", padding=(0, 1))
-            style.configure("Dark.TEntry", padding=4)
-            style.configure("Dark.TCombobox", padding=2)
-            style.configure("Badge.TLabel", padding=(7, 3), font=("Segoe UI", 8, "bold"))
-            self.hero_canvas.configure(height=self._u(70))
-            self.legal_bar.configure(height=self._u(38))
+        style.configure(".", font=("Microsoft YaHei UI", metrics.font_size))
+        style.configure(
+            "Section.TLabel", font=("Microsoft YaHei UI", metrics.section_font_size, "bold")
+        )
+        style.configure("Muted.TLabel", font=("Microsoft YaHei UI", metrics.muted_font_size))
+        compact_vertical = max(3, metrics.button_padding[1] - 2)
+        responsive_padding = (metrics.button_padding[0], compact_vertical)
+        style.configure("Secondary.TButton", padding=responsive_padding)
+        style.configure("Primary.TButton", padding=responsive_padding)
+        style.configure("Danger.TButton", padding=responsive_padding)
+        style.configure(
+            "Compact.TButton", padding=metrics.compact_button_padding,
+            font=("Microsoft YaHei UI", metrics.muted_font_size),
+        )
+        style.configure("Card.TCheckbutton", padding=(0, max(1, metrics.button_padding[1] // 2)))
+        style.configure("CardAlt.TCheckbutton", padding=(0, max(1, metrics.button_padding[1] // 3)))
+        style.configure("Dark.TEntry", padding=max(3, metrics.button_padding[1]))
+        style.configure("Dark.TCombobox", padding=max(2, metrics.compact_button_padding[1]))
+        style.configure(
+            "Badge.TLabel", padding=metrics.compact_button_padding,
+            font=("Segoe UI", metrics.muted_font_size, "bold"),
+        )
+        self.body.configure(padx=self._u(metrics.body_padding), pady=self._u(max(6, metrics.body_padding - 4)))
+        self.left_shell.configure(width=self._u(metrics.sidebar_width))
+        self.left_content.configure(padding=self._u(max(8, round(10 * metrics.layout_scale))))
+        self.palette_panel.configure(width=self._u(metrics.palette_width))
+        self.center_panel.pack_configure(padx=self._u(metrics.panel_gap))
+        self.hero_canvas.configure(height=self._u(metrics.hero_height))
+        self.legal_bar.configure(height=self._u(metrics.legal_height))
+        self.hero_canvas.itemconfigure(
+            self.hero_kicker_item,
+            font=("Segoe UI", metrics.muted_font_size, "bold"),
+        )
+        self.hero_canvas.itemconfigure(
+            self.hero_title_item,
+            font=("Microsoft YaHei UI", max(17, round(21 * metrics.layout_scale)), "bold"),
+        )
+        self.hero_canvas.itemconfigure(
+            self.hero_subtitle_item,
+            font=("Microsoft YaHei UI", metrics.font_size),
+        )
+        self._resize_tracer_logo(metrics.layout_scale)
+        if metrics.density != "regular":
             self.legal_label.configure(
                 text="免责声明｜用户上传并于B站发布，请自行甄别、谨慎使用；严禁传播违法违规内容。  ·  1280×720  ·  F8停止",
-                font=("Microsoft YaHei UI", 8),
+                font=("Microsoft YaHei UI", max(7, metrics.muted_font_size)),
             )
-            self.sidebar_footer_hint.pack_forget()
             self.palette_info_label.pack_forget()
+            self.palette_usage_hint.pack_forget()
+            self.fit_mode_label.pack_forget()
+            self.resample_mode_label.pack_forget()
+            self.match_mode_label.pack_forget()
+            if metrics.density == "tight":
+                self.file_label.pack_forget()
+                self.current_color_caption.pack_forget()
+                self.selected_color_label.pack_configure(pady=0)
         else:
-            style.configure(".", font=("Microsoft YaHei UI", 10))
-            style.configure("Section.TLabel", font=("Microsoft YaHei UI", 11, "bold"))
-            style.configure("Muted.TLabel", font=("Microsoft YaHei UI", 9))
-            style.configure("Secondary.TButton", padding=(12, 9))
-            style.configure("Primary.TButton", padding=(14, 11))
-            style.configure("Danger.TButton", padding=(12, 9))
-            style.configure("Compact.TButton", padding=(8, 6), font=("Microsoft YaHei UI", 9))
-            style.configure("Card.TCheckbutton", padding=(0, 4))
-            style.configure("Dark.TEntry", padding=7)
-            style.configure("Dark.TCombobox", padding=5)
-            style.configure("Badge.TLabel", padding=(10, 5), font=("Segoe UI", 9, "bold"))
-            self.hero_canvas.configure(height=self._u(90))
-            self.legal_bar.configure(height=self._u(48))
             self.legal_label.configure(
                 text=("免责声明｜本工具为用户上传并于B站发布，请自行甄别、谨慎使用。严禁制作、上传或传播任何与国家法律法规及政策相抵触的内容；\n"
                       "使用者自行承担使用风险及后果。  ·  建议游戏客户区 1280×720  ·  F8 紧急停止"),
                 font=("Microsoft YaHei UI", 8),
             )
-            if not self.sidebar_footer_hint.winfo_manager():
-                self.sidebar_footer_hint.pack(anchor="center", pady=(7, 0))
             if not self.palette_info_label.winfo_manager():
                 self.palette_info_label.pack(side="right")
+            if not self.current_color_caption.winfo_manager():
+                self.current_color_caption.pack(anchor="w", before=self.selected_color_label)
+            self.selected_color_label.pack_configure(pady=(3, 0))
+            if not self.palette_usage_hint.winfo_manager():
+                self.palette_usage_hint.pack(anchor="center", pady=(7, 0))
+        if metrics.density != "tight":
+            if not self.file_label.winfo_manager():
+                self.file_label.pack(
+                    anchor="w", fill="x", pady=(2, 6), before=self.image_buttons
+                )
+        if metrics.density == "regular":
+            if not self.fit_mode_label.winfo_manager():
+                self.fit_mode_label.pack(anchor="w", before=self.mode_box)
+            if not self.resample_mode_label.winfo_manager():
+                self.resample_mode_label.pack(anchor="w", before=self.resample_box)
+            if not self.match_mode_label.winfo_manager():
+                self.match_mode_label.pack(anchor="w", before=self.match_box)
+        if metrics.density != "tight":
+            if not self.current_color_caption.winfo_manager():
+                self.current_color_caption.pack(anchor="w", before=self.selected_color_label)
+            self.selected_color_label.pack_configure(pady=(3, 0))
         self.update_idletasks()
-        self.left_scroll_canvas.yview_moveto(0.0)
+
+    def _on_hero_configure(self, event):
+        """Keep Hero geometry and the Tracer logo anchored to live edges."""
+        width = max(1, event.width)
+        height = max(1, event.height)
+        layout_scale = max(0.78, min(1.30, min(
+            width / max(1, self._u(1180)),
+            height / max(1, self._u(90)),
+        )))
+        left = self._u(round(24 * layout_scale))
+        band_top = round(height * 0.72)
+        self.hero_canvas.coords(self.hero_band_item, 0, band_top, width, height)
+        self.hero_canvas.coords(self.hero_kicker_item, left, round(height * 0.20))
+        self.hero_canvas.coords(self.hero_title_item, left, round(height * 0.55))
+        self.hero_canvas.coords(
+            self.hero_subtitle_item,
+            self._u(round(380 * layout_scale)),
+            round(height * 0.58),
+        )
+        if self.hero_logo_item is not None:
+            self.hero_canvas.coords(
+                self.hero_logo_item,
+                width - self._u(24),
+                height // 2,
+            )
 
     def _minimize_window(self):
         self.update_idletasks()
@@ -2211,18 +2507,18 @@ class App(tk.Tk):
         canvas = self.palette_canvas
         canvas.delete("all")
         self.palette_hitboxes = []
-        canvas_w = max(canvas.winfo_width(), canvas.winfo_reqwidth())
-        canvas_h = max(canvas.winfo_height(), canvas.winfo_reqheight())
+        canvas_w = canvas.winfo_width() if canvas.winfo_width() > 1 else canvas.winfo_reqwidth()
+        canvas_h = canvas.winfo_height() if canvas.winfo_height() > 1 else canvas.winfo_reqheight()
         margin = self._u(5)
         gap_x = self._u(7)
         gap_y = self._u(4)
-        swatch = max(
-            self._u(16),
-            min(
-                (canvas_w - 2 * margin - 3 * gap_x) // 4,
-                (canvas_h - 2 * margin - 9 * gap_y) // 10,
-            ),
+        swatch = min(
+            (canvas_w - 2 * margin - 3 * gap_x) // 4,
+            (canvas_h - 2 * margin - 9 * gap_y) // 10,
         )
+        # Never enforce a minimum larger than the available height: doing so
+        # pushed the last palette column/row outside the Canvas at tight DPI.
+        swatch = max(1, int(swatch))
         grid_w = 4 * swatch + 3 * gap_x
         grid_h = 10 * swatch + 9 * gap_y
         start_x = max(margin, (canvas_w - grid_w) // 2)
@@ -2373,6 +2669,9 @@ class App(tk.Tk):
             self.match_strength_label.configure(
                 text=f"{round(self.match_strength.get()):d}%"
             )
+            self.structure_strength_label.configure(
+                text=f"{round(self.structure_strength.get()):d}%"
+            )
         except Exception:
             return
         if self.source_image is None:
@@ -2397,8 +2696,10 @@ class App(tk.Tk):
             self.dither_check.state(["!disabled"])
         if self.direct_bitmap_mode:
             self.resample_scale.state(["disabled"])
+            self.structure_scale.state(["disabled"])
         else:
             self.resample_scale.state(["!disabled"])
+            self.structure_scale.state(["!disabled"])
         if self.official_share_mode:
             self.match_scale.state(["disabled"])
         else:
@@ -2637,6 +2938,7 @@ class App(tk.Tk):
             reduce_transitions=self.reduce_transitions.get(),
             resample_strength=self.resample_strength.get() / 100.0,
             match_strength=self.match_strength.get() / 100.0,
+            structure_strength=self.structure_strength.get() / 100.0,
         )
         self.original_matrix = [row[:] for row in self.matrix]
         self.edit_history.clear()
@@ -2648,9 +2950,11 @@ class App(tk.Tk):
         transition_name = "，已减少过渡色" if self.reduce_transitions.get() else ""
         resample_ratio = round(self.resample_strength.get())
         match_ratio = round(self.match_strength.get())
+        structure_ratio = round(self.structure_strength.get())
+        structure_name = f"＋结构增强 {structure_ratio}%" if structure_ratio else ""
         self._update_matrix_info(
             f"转换完成：{resample_name} {resample_ratio}%＋{match_name} {match_ratio}%"
-            f"{transition_name}，"
+            f"{structure_name}{transition_name}，"
             f"共使用 {used} 种游戏颜色；可继续修改。"
         )
 
@@ -2809,11 +3113,61 @@ class App(tk.Tk):
             return
         webbrowser.open(release.get("download_url") or release["page_url"])
 
+    @staticmethod
+    def _window_label(item):
+        title = item["title"]
+        if len(title) > 30:
+            title = title[:29] + "…"
+        return f"{title}  [{item['width']}×{item['height']}]  PID {item['pid']}"
+
+    def refresh_window_list(self):
+        previous = self.window_choices.get(self.window_choice.get())
+        previous_hwnd = previous.get("hwnd") if previous else None
+        choices = list_selectable_windows()
+        mapping = {}
+        for item in choices:
+            base = self._window_label(item)
+            label = base
+            suffix = 2
+            while label in mapping:
+                label = f"{base} #{suffix}"
+                suffix += 1
+            mapping[label] = item
+        self.window_choices = mapping
+        self.window_box.configure(values=tuple(mapping))
+        selected = next(
+            (label for label, item in mapping.items() if item["hwnd"] == previous_hwnd),
+            None,
+        )
+        if selected is None:
+            selected = next(
+                (label for label, item in mapping.items()
+                 if "明日方舟" in item["title"] or item["class"] == "UnityWndClass"),
+                "请选择游戏窗口" if mapping else "未发现可选择窗口",
+            )
+        self.window_choice.set(selected)
+
+    def _on_window_selected(self, _event=None):
+        target = self._selected_window_target(warn=False)
+        if target:
+            self.status_var.set(
+                f"已选择游戏窗口：{target['title']}  "
+                f"({target['width']}×{target['height']})"
+            )
+
+    def _selected_window_target(self, warn=True):
+        target = self.window_choices.get(self.window_choice.get())
+        if not target and warn:
+            messagebox.showwarning("未选择窗口", "请点击“刷新”，然后从下拉列表选择游戏窗口。")
+        return target
+
     def check_window(self):
-        keyword = self.window_keyword.get().strip()
-        hwnd, title = find_game_window(keyword)
+        target = self._selected_window_target()
+        if not target:
+            return
+        hwnd, title = resolve_selected_window(target)
         if not hwnd:
-            messagebox.showwarning("未找到", f"未找到标题包含“{keyword}”的窗口。")
+            messagebox.showwarning("窗口失效", "所选窗口已关闭或重建，请刷新后重新选择。")
             return
 
         ox, oy, w, h = get_client_info(hwnd)
@@ -2831,6 +3185,10 @@ class App(tk.Tk):
     def start_paint(self):
         if self.source_image is None:
             messagebox.showwarning("没有图片", "请先选择一张图片。")
+            return
+
+        target = self._selected_window_target()
+        if not target:
             return
 
         if not messagebox.askokcancel(
@@ -2852,13 +3210,12 @@ class App(tk.Tk):
         self.status_var.set("正在启动自动填充…")
 
         matrix_copy = [row[:] for row in self.matrix]
-        keyword = self.window_keyword.get().strip()
         delay = max(0.04, float(self.click_delay.get()))
         skip_white = bool(self.skip_white.get())
 
         t = threading.Thread(
             target=self.painter.paint,
-            args=(matrix_copy, keyword, delay, skip_white),
+            args=(matrix_copy, dict(target), delay, skip_white),
             daemon=True,
         )
         t.start()

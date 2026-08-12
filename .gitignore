@@ -9,6 +9,10 @@ venv/
 # PyInstaller output
 build/
 dist/
+dist-new/
+dist-responsive/
+dist-qt/
+dist-qt-fixed/
 .demo-output/
 
 # IDE and OS metadata
@@ -18,8 +22,10 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Local reference packs and manual test inputs
-assets/
+# Local reference packs and manual test inputs.  Only the original Tracer
+# brand mark used by the application is distributable project artwork.
+assets/*
+!assets/tracer_logo_transparent.png
 reference_assets/
 tests/samples/
 

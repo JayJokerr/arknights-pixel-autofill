@@ -2,10 +2,13 @@
 
 from pathlib import Path
 
-asset_datas = [('assets', 'assets')] if Path('assets').is_dir() else []
+asset_datas = [('arknights_pixel.ico', '.')]
+transparent_logo = Path('assets/tracer_logo_transparent.png')
+if transparent_logo.is_file():
+    asset_datas.append((str(transparent_logo), 'assets'))
 
 a = Analysis(
-    ['arknights_pixel_autofill.py'],
+    ['arknights_pixel_qt.py'],
     pathex=[],
     binaries=[],
     datas=asset_datas,
@@ -13,9 +16,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Pillow can optionally integrate with NumPy, but this application does not
-    # use that path.  Excluding it keeps the executable smaller and avoids
-    # collecting unrelated scientific packages from a system Python install.
+    # Pillow can optionally integrate with NumPy, which is unused here.
     excludes=['numpy'],
     noarchive=False,
     optimize=0,
@@ -28,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Arknights-Pixel-Autofill',
+    name='Arknights-Pixel-Autofill-v1.4.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
