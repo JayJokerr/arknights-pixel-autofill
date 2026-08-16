@@ -43,4 +43,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['arknights_pixel.ico'],
+    uac_admin=True,
 )

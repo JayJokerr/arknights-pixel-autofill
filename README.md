@@ -8,7 +8,7 @@
 
 - GitHub：[Releases](https://github.com/JayJokerr/arknights-pixel-autofill/releases)
 - 夸克网盘：链接见B站发布页评论区或置顶评论
-- 软件必须以管理员身份启动，否则会提示后退出
+- 软件启动时会自动请求管理员权限，取消 UAC 后会提示并退出
 
 ### v1.4.0 文件校验与 Windows 提示
 
@@ -182,9 +182,9 @@
 
 ### 1. 启动
 
-1. 右键 `Arknights-Pixel-Autofill-v1.4.0.exe`。
-2. 选择 **以管理员身份运行**，在UAC提示中选择“是”。
-3. 非管理员启动时程序只显示权限提示并退出，这是预期行为。
+1. 双击 `Arknights-Pixel-Autofill-v1.4.0.exe`。
+2. 程序会自动请求管理员权限；在 UAC 提示中选择“是”。
+3. 如果取消或无法完成提权，程序会显示权限提示并退出。
 
 ### 2. 准备游戏
 
