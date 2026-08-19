@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -69,16 +70,42 @@ def is_running_as_admin():
         return False
 
 
+def restart_as_admin():
+    """Ask Windows to restart this program with an elevated token."""
+    if getattr(sys, "frozen", False):
+        executable = sys.executable
+        arguments = sys.argv[1:]
+    else:
+        executable = sys.executable
+        arguments = [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
+
+    try:
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            executable,
+            subprocess.list2cmdline(arguments),
+            os.getcwd(),
+            1,  # SW_SHOWNORMAL
+        )
+        return int(result) > 32
+    except Exception:
+        return False
+
+
 def require_admin_before_startup():
-    """Show a native warning and stop before Qt is created when not elevated."""
+    """Elevate before Qt is created and stop the unelevated process."""
     if is_running_as_admin():
         return True
+    if restart_as_admin():
+        return False
     try:
         ctypes.windll.user32.MessageBoxW(
             None,
             "本工具需要管理员权限才能向游戏窗口稳定发送鼠标输入。\n\n"
-            "请关闭本提示后，右键程序并选择“以管理员身份运行”。",
-            "需要管理员权限",
+            "未能获得管理员权限。请在 UAC 提示中选择“是”，或右键程序并选择"
+            "“以管理员身份运行”。",
+            "管理员权限请求未完成",
             0x00000000 | 0x00000030 | 0x00040000 | 0x00010000,
             # MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
         )
